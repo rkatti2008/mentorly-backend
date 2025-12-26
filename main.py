@@ -1,3 +1,5 @@
+import os
+from openai import OpenAI
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,9 +17,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 class ChatRequest(BaseModel):
     message: str
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    return {"reply": f"Kaz says: {req.message}"}
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are Mentorly, a helpful college counseling assistant for Indian students applying abroad."
+            },
+            {
+                "role": "user",
+                "content": req.message
+            }
+        ],
+        temperature=0.4
+    )
+
+    reply = response.choices[0].message.content
+    return {"reply": reply}
