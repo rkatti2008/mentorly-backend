@@ -16,21 +16,16 @@ SHEET_ID = "1lItXDgWdnngFQL_zBxSD4dOBlnwInll698UX6o4bX3A"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 if not SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable not set")
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
 
-creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
-creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+creds = Credentials.from_service_account_info(
+    json.loads(SERVICE_ACCOUNT_JSON), scopes=SCOPES
+)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
 
 # -------------------------------
-# Pydantic model (optional future use)
-# -------------------------------
-class ChatRequest(BaseModel):
-    message: str
-
-# -------------------------------
-# Helper functions
+# Helpers
 # -------------------------------
 def passes_numeric_filter(value_raw, min_val=None, max_val=None):
     try:
@@ -46,9 +41,7 @@ def passes_numeric_filter(value_raw, min_val=None, max_val=None):
 
 
 def fuzzy_match(text, patterns, threshold=0.7):
-    if patterns is None:
-        return True
-    if text is None:
+    if patterns is None or text is None:
         return False
 
     text = str(text).lower()
@@ -63,39 +56,39 @@ def fuzzy_match(text, patterns, threshold=0.7):
     return False
 
 # -------------------------------
+# Column mapping
+# -------------------------------
+TEXT_COLUMN_MAP = {
+    "city": "City of Graduation",
+    "intended_major": "Intended Major",
+    "countries applied to": "Countries Applied To",
+    "admitted univs": "Admitted Univs",
+    "rejected univs": "Rejected Univs",
+}
+
+# -------------------------------
 # /students endpoint
 # -------------------------------
 @app.get("/students")
 async def get_students(request: Request):
-    """
-    Dynamic filtering endpoint with:
-    - Numeric min/max filters (SAT, ACT, IB)
-    - Multiple intended majors (comma-separated)
-    - Fuzzy text matching
-    - SAT and ACT mutually exclusive
-    """
 
     records = sheet.get_all_records()
     filtered = []
-
     qp = dict(request.query_params)
 
     # -------------------------------
     # SAT vs ACT mutual exclusion
     # -------------------------------
-    sat_columns = ["SAT Total score", "SAT Math", "SAT English"]
-    act_columns = ["ACT Score"]
+    sat_cols = ["SAT Total score", "SAT Math", "SAT English"]
+    act_cols = ["ACT Score"]
 
     sat_present = any(
-        key.rsplit("_", 1)[0] in sat_columns
-        for key in qp
-        if key.endswith("_min") or key.endswith("_max")
+        key.rsplit("_", 1)[0] in sat_cols
+        for key in qp if key.endswith("_min") or key.endswith("_max")
     )
-
     act_present = any(
-        key.rsplit("_", 1)[0] in act_columns
-        for key in qp
-        if key.endswith("_min") or key.endswith("_max")
+        key.rsplit("_", 1)[0] in act_cols
+        for key in qp if key.endswith("_min") or key.endswith("_max")
     )
 
     if sat_present and act_present:
@@ -105,7 +98,7 @@ async def get_students(request: Request):
         )
 
     # -------------------------------
-    # Apply filters
+    # Filtering
     # -------------------------------
     for r in records:
         include = True
@@ -114,42 +107,37 @@ async def get_students(request: Request):
 
             # ---------- Numeric filters ----------
             if key.endswith("_min") or key.endswith("_max"):
-                col = key.rsplit("_", 1)[0]
-                min_val = int(qp.get(f"{col}_min")) if f"{col}_min" in qp else None
-                max_val = int(qp.get(f"{col}_max")) if f"{col}_max" in qp else None
+                base = key.rsplit("_", 1)[0]
+                min_val = int(qp.get(f"{base}_min")) if f"{base}_min" in qp else None
+                max_val = int(qp.get(f"{base}_max")) if f"{base}_max" in qp else None
 
-                # IB filter → only for IBDP students
-                if col.lower().startswith("ib"):
+                # IB handling
+                if base.startswith("ib"):
                     if r.get("12th Board", "").strip().upper() != "IBDP":
                         include = False
                         break
                     col = "12th grade overall score"
+                else:
+                    col = base
 
                 if not passes_numeric_filter(r.get(col), min_val, max_val):
                     include = False
                     break
 
-            # ---------- Text / fuzzy filters ----------
+            # ---------- Text filters ----------
             else:
                 key_l = key.lower()
+                sheet_col = TEXT_COLUMN_MAP.get(key_l)
 
-                if key_l == "intended_major":
-                    if not fuzzy_match(r.get("Intended Major"), value):
+                if not sheet_col:
+                    continue
+
+                if key_l == "city":
+                    if value.lower() != str(r.get(sheet_col, "")).lower():
                         include = False
                         break
-
-                elif key_l == "city":
-                    if value.lower() != str(r.get("City of Graduation", "")).lower():
-                        include = False
-                        break
-
-                elif key_l in ["countries applied to", "admitted univs", "rejected univs"]:
-                    if not fuzzy_match(r.get(key), value):
-                        include = False
-                        break
-
                 else:
-                    if not fuzzy_match(r.get(key), value):
+                    if not fuzzy_match(r.get(sheet_col), value):
                         include = False
                         break
 
