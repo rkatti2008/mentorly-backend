@@ -4,13 +4,25 @@ import gspread
 from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
 
+import os
+import json
+
 app = FastAPI()
+
+
+
+
 
 # -------------------------------
 # Google Sheets Setup
 # -------------------------------
 SERVICE_ACCOUNT_FILE = "service_account.json"
 SHEET_ID = "1lItXDgWdnngFQL_zBxSD4dOBlnwInll698UX6o4bX3A"
+
+# Write the JSON from environment variable to a file at runtime
+if "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ:
+    with open(SERVICE_ACCOUNT_FILE, "w") as f:
+        f.write(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
