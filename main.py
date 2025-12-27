@@ -1,39 +1,30 @@
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
-
 import os
 import json
 
 app = FastAPI()
 
-
-
-
-
 # -------------------------------
 # Google Sheets Setup
 # -------------------------------
-SERVICE_ACCOUNT_FILE = "service_account.json"
+SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 SHEET_ID = "1lItXDgWdnngFQL_zBxSD4dOBlnwInll698UX6o4bX3A"
-
-# Write the JSON from environment variable to a file at runtime
-if "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ:
-    with open(SERVICE_ACCOUNT_FILE, "w") as f:
-        f.write(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-creds = Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES
-)
+if not SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON environment variable")
+
+creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
+creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 client = gspread.authorize(creds)
-sheet = client.open_by_key(SHEET_ID).sheet1  # first worksheet
+sheet = client.open_by_key(SHEET_ID).sheet1
 
 # -------------------------------
-# Pydantic model for chat (if needed)
+# Optional chat model (future use)
 # -------------------------------
 class ChatRequest(BaseModel):
     message: str
@@ -53,97 +44,124 @@ def passes_numeric_filter(value_raw, min_val=None, max_val=None):
         return False
     return True
 
-def fuzzy_match(text, patterns, threshold=0.7, multiple=False):
-    """
-    Return True if text approximately matches any of the patterns.
-    Case-insensitive, partial match.
-    - multiple=True for comma-separated pattern values
-    """
+
+def fuzzy_match(text, patterns, threshold=0.7):
     if patterns is None:
         return True
     if text is None:
         return False
 
     text = str(text).lower()
-    if multiple or isinstance(patterns, str):
-        patterns = [p.strip() for p in str(patterns).split(",")]
+    patterns = [p.strip().lower() for p in str(patterns).split(",")]
 
-    for pattern in patterns:
-        pattern = pattern.lower()
-        if pattern in text:
+    for p in patterns:
+        if p in text:
             return True
-        if SequenceMatcher(None, text, pattern).ratio() >= threshold:
+        if SequenceMatcher(None, text, p).ratio() >= threshold:
             return True
 
     return False
+
+
+# Map API params → Google Sheet columns
+COLUMN_MAP = {
+    "city": "City of Graduation",
+    "intended_major": "Intended Major",
+    "countries applied to": "Countries Applied To",
+    "admitted univs": "Admitted Univs",
+    "rejected univs": "Rejected Univs",
+}
 
 # -------------------------------
 # /students endpoint
 # -------------------------------
 @app.get("/students")
 async def get_students(request: Request):
-    """
-    Dynamic filtering endpoint with:
-    - Fuzzy text search for text columns
-    - Numeric min/max for SAT, ACT, IB
-    - Multiple intended majors (comma-separated)
-    - SAT and ACT filters are mutually exclusive
-    - Fuzzy search for Countries Applied To, Admitted Univs, Rejected Univs
-    """
     records = sheet.get_all_records()
     filtered = []
 
-    query_params = dict(request.query_params)
+    qp = dict(request.query_params)
 
-    # Detect SAT and ACT range filters
-    sat_keys = ["SAT Total score", "SAT Math", "SAT English"]
-    act_keys = ["ACT Score"]
+    # -------------------------------
+    # Detect SAT vs ACT conflict
+    # -------------------------------
+    sat_present = any(k.startswith("sat_") for k in qp)
+    act_present = any(k.startswith("act_") for k in qp)
 
-    sat_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in sat_keys)
-    act_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in act_keys)
-
-    if sat_filter and act_filter:
+    if sat_present and act_present:
         raise HTTPException(
             status_code=400,
             detail="Please filter using either SAT or ACT, not both."
         )
 
+    # -------------------------------
+    # Extract IB filters ONCE
+    # -------------------------------
+    ib_min = qp.get("ib_min_12")
+    ib_max = qp.get("ib_max_12")
+
+    ib_min = int(ib_min) if ib_min is not None else None
+    ib_max = int(ib_max) if ib_max is not None else None
+
     for r in records:
         include = True
 
-        for key, value in query_params.items():
+        # -------------------------------
+        # IB FILTER (record-level)
+        # -------------------------------
+        if ib_min is not None or ib_max is not None:
+            if r.get("12th Board", "").strip().upper() != "IBDP":
+                continue
+
+            try:
+                ib_score = int(r.get("12th grade overall score"))
+            except (TypeError, ValueError):
+                continue
+
+            if ib_min is not None and ib_score < ib_min:
+                continue
+            if ib_max is not None and ib_score > ib_max:
+                continue
+
+        # -------------------------------
+        # Other query filters
+        # -------------------------------
+        for key, value in qp.items():
+
+            # Skip IB params (already handled)
+            if key in ["ib_min_12", "ib_max_12"]:
+                continue
+
+            # -------------------
+            # Numeric filters
+            # -------------------
             if key.endswith("_min") or key.endswith("_max"):
-                # Numeric filter
                 col = key.rsplit("_", 1)[0]
-                min_val = int(query_params.get(f"{col}_min")) if f"{col}_min" in query_params else None
-                max_val = int(query_params.get(f"{col}_max")) if f"{col}_max" in query_params else None
 
-                # Map IB filter to actual sheet column
-                if col.lower().startswith("ib"):
-                    if r.get("12th Board", "").strip().upper() != "IBDP":
-                        include = False
-                        break
-                    col = "12th grade overall score"
+                min_val = qp.get(f"{col}_min")
+                max_val = qp.get(f"{col}_max")
 
-                if not passes_numeric_filter(r.get(col), min_val, max_val):
+                min_val = int(min_val) if min_val is not None else None
+                max_val = int(max_val) if max_val is not None else None
+
+                sheet_col = COLUMN_MAP.get(col.lower(), col)
+
+                if not passes_numeric_filter(r.get(sheet_col), min_val, max_val):
                     include = False
                     break
+
+            # -------------------
+            # Text / fuzzy filters
+            # -------------------
             else:
-                # Text / fuzzy filter
-                if key.lower() == "intended_major":
-                    if not fuzzy_match(r.get("Intended Major"), value, multiple=True):
-                        include = False
-                        break
-                elif key.lower() == "city":
-                    if value.lower() != str(r.get("City of Graduation", "")).lower():
-                        include = False
-                        break
-                elif key.lower() in ["countries applied to", "admitted univs", "rejected univs"]:
-                    if not fuzzy_match(r.get(key), value):
+                sheet_col = COLUMN_MAP.get(key.lower(), key)
+
+                if key.lower() == "city":
+                    if value.lower() != str(r.get(sheet_col, "")).lower():
                         include = False
                         break
                 else:
-                    if not fuzzy_match(r.get(key), value):
+                    if not fuzzy_match(r.get(sheet_col), value):
                         include = False
                         break
 
