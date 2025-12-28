@@ -206,7 +206,7 @@ async def nl_query(req: ChatRequest):
     Natural language → LLM → filters → students
     """
 
- prompt = f"""
+prompt = f"""
 You are a strict JSON generator.
 
 Your task:
