@@ -206,28 +206,39 @@ async def nl_query(req: ChatRequest):
     Natural language → LLM → filters → students
     """
 
-    prompt = f"""
-You are a filter extraction engine.
+ prompt = f"""
+You are a strict JSON generator.
 
-Convert the following user query into a JSON object of filters.
+Your task:
+Convert the user query into a JSON object of filters.
+
+CRITICAL RULES:
+- Output ONLY raw JSON
+- Do NOT include markdown
+- Do NOT include backticks
+- Do NOT include explanations
+- Do NOT include text before or after JSON
+- JSON must start with {{ and end with }}
+
+Allowed keys ONLY:
+ib_min_12, ib_max_12,
+"SAT Total score_min", "SAT Total score_max",
+"ACT Score_min", "ACT Score_max",
+intended_major,
+admitted univs,
+countries applied to,
+city
 
 Rules:
-- Output ONLY valid JSON
-- Keys must match EXACTLY:
-  ib_min_12, ib_max_12,
-  "SAT Total score_min", "SAT Total score_max",
-  "ACT Score_min", "ACT Score_max",
-  intended_major,
-  admitted univs,
-  countries applied to,
-  city
 - SAT and ACT must NEVER both appear
-- Values must be strings or numbers
-- Do not include keys not mentioned in the query
+- Use numbers for numeric values
+- Use strings for text values
+- Omit keys not mentioned in the query
 
 User query:
 "{req.message}"
 """
+  
 
     try:
         response = client_llm.chat.completions.create(
@@ -237,14 +248,31 @@ User query:
         )
 
         raw_output = response.choices[0].message.content.strip()
-        filters = json.loads(raw_output)
-
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="LLM output could not be parsed"
-        )
-
+        
+        # ---- SANITIZE LLM OUTPUT ----
+        if raw_output.startswith("```"):
+            raw_output = raw_output.strip("`")
+            raw_output = raw_output.replace("json", "", 1).strip()
+            
+            
+        # Remove accidental leading text
+        start = raw_output.find("{")
+        end = raw_output.rfind("}")
+        
+        if start == -1 or end == -1:
+            raise HTTPException(
+                status_code=400,
+                detail="LLM output did not contain JSON"
+            )
+        json_str = raw_output[start:end + 1]
+        
+        try:
+            filters = json.loads(json_str)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail="LLM output could not be parsed"
+            )
     except Exception as e:
         raise HTTPException(
             status_code=500,
