@@ -1,49 +1,45 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
+import gspread
+from google.oauth2.service_account import Credentials
+from difflib import SequenceMatcher
 import os
 import json
-import csv
-import io
 
-app = FastAPI(title="Mentorly Backend")
+app = FastAPI()
 
-# ------------------------
-# Environment validation
-# ------------------------
-
+# -------------------------------
+# Google Sheets Setup
+# -------------------------------
+SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
+if not SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
 if not SHEET_ID:
     raise RuntimeError("SHEET_ID not set")
 
-if not GOOGLE_SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
+creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
+creds = Credentials.from_service_account_info(
+    creds_dict,
+    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+)
 
-# ------------------------
-# Constants
-# ------------------------
+client = gspread.authorize(creds)
+sheet = client.open_by_key(SHEET_ID).sheet1
 
-NUMERIC_COLUMNS = {
-    "SAT Total score",
-    "ACT Composite",
-    "12th grade overall score",
-}
+# -------------------------------
+# Models
+# -------------------------------
+class ChatRequest(BaseModel):
+    message: str
 
-FUZZY_TEXT_COLUMNS = {
-    "admitted univs",
-    "countries applied to",
-    "intended_major",
-}
-
-# ------------------------
-# Utilities
-# ------------------------
-
-def passes_numeric_filter(value, min_val=None, max_val=None) -> bool:
+# -------------------------------
+# Helpers
+# -------------------------------
+def passes_numeric_filter(value_raw, min_val=None, max_val=None):
     try:
-        value = int(value)
+        value = int(value_raw)
     except (TypeError, ValueError):
         return False
 
@@ -54,149 +50,144 @@ def passes_numeric_filter(value, min_val=None, max_val=None) -> bool:
     return True
 
 
-def load_students() -> List[Dict[str, Any]]:
+def fuzzy_match(text, pattern, threshold=0.7):
+    if not text or not pattern:
+        return False
+
+    text = str(text).lower()
+    pattern = str(pattern).lower()
+
+    if pattern in text:
+        return True
+
+    return SequenceMatcher(None, text, pattern).ratio() >= threshold
+
+
+def get_column_value(row: dict, key: str):
     """
-    Loads student data from Google Sheets CSV export.
+    Case-insensitive + space-insensitive column lookup
+    Fixes fuzzy filter bugs for admitted univs, countries applied to, etc.
     """
-    import requests
-
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-    response = requests.get(url)
-    response.raise_for_status()
-
-    reader = csv.DictReader(io.StringIO(response.text))
-    return list(reader)
+    key_norm = key.lower().strip()
+    for col in row:
+        if col.lower().strip() == key_norm:
+            return row[col]
+    return None
 
 
-def filter_students(records: List[Dict[str, Any]], query_params: Dict[str, str]):
-    results = []
+# -------------------------------
+# Core filter engine (LOCKED)
+# -------------------------------
+def filter_students(records, query_params):
+    filtered = []
+
+    # SAT / ACT mutual exclusion
+    sat_used = any(k.startswith("SAT") for k in query_params)
+    act_used = any(k.startswith("ACT") for k in query_params)
+
+    if sat_used and act_used:
+        raise HTTPException(
+            status_code=400,
+            detail="Please filter using either SAT or ACT, not both."
+        )
 
     for r in records:
         include = True
 
-        # ----------------------------------
-        # IB FILTER (explicit + safe)
-        # ----------------------------------
+        # ---- IB FILTER ----
         if "ib_min_12" in query_params or "ib_max_12" in query_params:
             if r.get("12th Board", "").strip().upper() != "IBDP":
-                include = False
-            else:
-                try:
-                    min_ib = int(query_params.get("ib_min_12")) if query_params.get("ib_min_12") else None
-                    max_ib = int(query_params.get("ib_max_12")) if query_params.get("ib_max_12") else None
-                except ValueError:
-                    include = False
+                continue
 
-                if not passes_numeric_filter(
-                    r.get("12th grade overall score"),
-                    min_ib,
-                    max_ib,
-                ):
-                    include = False
+            min_ib = query_params.get("ib_min_12")
+            max_ib = query_params.get("ib_max_12")
 
-        if not include:
-            continue
+            try:
+                min_ib = int(min_ib) if min_ib is not None else None
+                max_ib = int(max_ib) if max_ib is not None else None
+            except ValueError:
+                continue
 
-        # ----------------------------------
-        # GENERIC NUMERIC FILTERS
-        # ----------------------------------
-        for key in query_params:
-            if key.endswith("_min") or key.endswith("_max"):
-                col = key.replace("_min", "").replace("_max", "")
-
-                if col not in NUMERIC_COLUMNS:
-                    continue
-
-                try:
-                    min_val = int(query_params.get(f"{col}_min")) if f"{col}_min" in query_params else None
-                    max_val = int(query_params.get(f"{col}_max")) if f"{col}_max" in query_params else None
-                except ValueError:
-                    include = False
-                    break
-
-                if not passes_numeric_filter(r.get(col), min_val, max_val):
-                    include = False
-                    break
-
-        if not include:
-            continue
-
-        # ----------------------------------
-        # FUZZY TEXT FILTERS (substring)
-        # ----------------------------------
-        for col in FUZZY_TEXT_COLUMNS:
-            if col in query_params:
-                q = query_params[col].strip().lower()
-                cell = str(r.get(col, "")).lower()
-
-                if q not in cell:
-                    include = False
-                    break
-
-        if not include:
-            continue
-
-        # ----------------------------------
-        # EXACT MATCH (fallback)
-        # ----------------------------------
-        for key, val in query_params.items():
-            if (
-                key in NUMERIC_COLUMNS
-                or key in FUZZY_TEXT_COLUMNS
-                or key.endswith("_min")
-                or key.endswith("_max")
-                or key.startswith("ib_")
+            if not passes_numeric_filter(
+                r.get("12th grade overall score"),
+                min_ib,
+                max_ib,
             ):
                 continue
 
-            if str(r.get(key, "")).strip().lower() != val.strip().lower():
-                include = False
-                break
+        # ---- SAT FILTER (FIXED) ----
+        if "SAT Total score_min" in query_params or "SAT Total score_max" in query_params:
+            if not passes_numeric_filter(
+                r.get("SAT Total score"),
+                query_params.get("SAT Total score_min"),
+                query_params.get("SAT Total score_max"),
+            ):
+                continue
+
+        # ---- ACT FILTER ----
+        if "ACT Score_min" in query_params or "ACT Score_max" in query_params:
+            if not passes_numeric_filter(
+                r.get("ACT Score"),
+                query_params.get("ACT Score_min"),
+                query_params.get("ACT Score_max"),
+            ):
+                continue
+
+        # ---- TEXT FILTERS ----
+        for key, val in query_params.items():
+            if key in [
+                "ib_min_12", "ib_max_12",
+                "SAT Total score_min", "SAT Total score_max",
+                "ACT Score_min", "ACT Score_max"
+            ]:
+                continue
+
+            if key.lower() == "intended_major":
+                majors = [m.strip() for m in val.split(",")]
+                cell = get_column_value(r, "Intended Major")
+                if not any(fuzzy_match(cell, m) for m in majors):
+                    include = False
+                    break
+
+            elif key.lower() == "city":
+                if r.get("City of Graduation", "").lower() != val.lower():
+                    include = False
+                    break
+
+            else:
+                cell = get_column_value(r, key)
+                if not fuzzy_match(cell, val):
+                    include = False
+                    break
 
         if include:
-            results.append(r)
+            filtered.append(r)
 
-    return results
-
-
-# ------------------------
-# API Models
-# ------------------------
-
-class ChatRequest(BaseModel):
-    query: str
-
-
-# ------------------------
-# API Endpoints
-# ------------------------
-
-@app.get("/students")
-async def get_students(**query_params: str):
-    records = load_students()
-    filtered = filter_students(records, query_params)
     return filtered
 
 
-@app.post("/nl_query")
-async def nl_query(req: ChatRequest):
-    """
-    Phase 2.3 – NL → filters
-    (LLM wired, fallback safe)
-    """
+# -------------------------------
+# GET /students
+# -------------------------------
+@app.get("/students")
+async def get_students(request: Request):
+    records = sheet.get_all_records()
+    query_params = dict(request.query_params)
 
-    # Temporary example output (replace with real LLM later)
-    text = req.query.lower()
-    filters = {}
+    # Convert numeric params
+    for k in list(query_params.keys()):
+        if k.endswith("_min") or k.endswith("_max"):
+            try:
+                query_params[k] = int(query_params[k])
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid numeric value for {k}"
+                )
 
-    if "georgia" in text:
-        filters["admitted univs"] = "Georgia"
-    if "computer" in text:
-        filters["intended_major"] = "Computer Science"
-    if "ib" in text and "35" in text:
-        filters["ib_min_12"] = 35
+    students = filter_students(records, query_params)
 
     return {
-        "interpreted_filters": filters,
-        "note": "Generated by LLM"
+        "count": len(students),
+        "students": students
     }
