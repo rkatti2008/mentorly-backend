@@ -191,3 +191,56 @@ async def get_students(request: Request):
         "count": len(students),
         "students": students
     }
+
+# -------------------------------
+# POST /nl_query (Phase 2.4)
+# -------------------------------
+@app.post("/nl_query")
+async def nl_query(req: ChatRequest):
+    """
+    Natural language → filters → students
+    """
+
+    user_query = req.message.lower()
+
+    # -------------------------------
+    # Phase 2.3 — Interpret NL → filters
+    # (rule-based for now; LLM later)
+    # -------------------------------
+    filters = {}
+
+    if "ib" in user_query:
+        if "35" in user_query:
+            filters["ib_min_12"] = 35
+        if "36" in user_query and "40" in user_query:
+            filters["ib_min_12"] = 36
+            filters["ib_max_12"] = 40
+
+    if "sat" in user_query:
+        if "1450" in user_query:
+            filters["SAT Total score_min"] = 1450
+
+    if "act" in user_query:
+        if "30" in user_query:
+            filters["ACT Score_min"] = 30
+
+    if "georgia" in user_query:
+        filters["admitted univs"] = "Georgia"
+
+    if "usa" in user_query:
+        filters["countries applied to"] = "USA"
+
+    if "computer science" in user_query or "cs" in user_query:
+        filters["intended_major"] = "Computer Science"
+
+    # -------------------------------
+    # Phase 2.4 — Execute filters
+    # -------------------------------
+    records = sheet.get_all_records()
+    students = filter_students(records, filters)
+
+    return {
+        "interpreted_filters": filters,
+        "count": len(students),
+        "students": students
+    }
