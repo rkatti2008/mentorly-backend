@@ -206,40 +206,39 @@ async def nl_query(req: ChatRequest):
     Natural language → LLM → filters → students
     """
 
-prompt = f"""
-You are a strict JSON generator.
+    prompt = f"""
+        You are a strict JSON generator.
 
-Your task:
-Convert the user query into a JSON object of filters.
+        Your task:
+        Convert the user query into a JSON object of filters.
 
-CRITICAL RULES:
-- Output ONLY raw JSON
-- Do NOT include markdown
-- Do NOT include backticks
-- Do NOT include explanations
-- Do NOT include text before or after JSON
-- JSON must start with {{ and end with }}
+        CRITICAL RULES:
+        - Output ONLY raw JSON
+        - Do NOT include markdown
+        - Do NOT include backticks
+        - Do NOT include explanations
+        - Do NOT include text before or after JSON
+        - JSON must start with {{ and end with }}
 
-Allowed keys ONLY:
-ib_min_12, ib_max_12,
-"SAT Total score_min", "SAT Total score_max",
-"ACT Score_min", "ACT Score_max",
-intended_major,
-admitted univs,
-countries applied to,
-city
+        Allowed keys ONLY:
+        ib_min_12, ib_max_12,
+        "SAT Total score_min", "SAT Total score_max",
+        "ACT Score_min", "ACT Score_max",
+        intended_major,
+        admitted univs,
+        countries applied to,
+        city
 
-Rules:
-- SAT and ACT must NEVER both appear
-- Use numbers for numeric values
-- Use strings for text values
-- Omit keys not mentioned in the query
+        Rules:
+        - SAT and ACT must NEVER both appear
+        - Use numbers for numeric values
+        - Use strings for text values
+        - Omit keys not mentioned in the query
 
-User query:
-"{req.message}"
-"""
+    User query:
+        "{req.message}"
+    """
   
-
     try:
         response = client_llm.chat.completions.create(
             model="gpt-4o-mini",
