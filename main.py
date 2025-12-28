@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException
+from openai import OpenAI
 from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
@@ -27,6 +28,11 @@ creds = Credentials.from_service_account_info(
 
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
+
+client_llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+if not os.environ.get("OPENAI_API_KEY"):
+    raise RuntimeError("OPENAI_API_KEY not set")
 
 # -------------------------------
 # Models
@@ -192,49 +198,61 @@ async def get_students(request: Request):
         "students": students
     }
 
-# -------------------------------
-# POST /nl_query (Phase 2.4)
-# -------------------------------
+
+
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
     """
-    Natural language → filters → students
+    Natural language → LLM → filters → students
     """
 
-    user_query = req.message.lower()
+    prompt = f"""
+You are a filter extraction engine.
+
+Convert the following user query into a JSON object of filters.
+
+Rules:
+- Output ONLY valid JSON
+- Keys must match EXACTLY:
+  ib_min_12, ib_max_12,
+  "SAT Total score_min", "SAT Total score_max",
+  "ACT Score_min", "ACT Score_max",
+  intended_major,
+  admitted univs,
+  countries applied to,
+  city
+- SAT and ACT must NEVER both appear
+- Values must be strings or numbers
+- Do not include keys not mentioned in the query
+
+User query:
+"{req.message}"
+"""
+
+    try:
+        response = client_llm.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        raw_output = response.choices[0].message.content.strip()
+        filters = json.loads(raw_output)
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="LLM output could not be parsed"
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
     # -------------------------------
-    # Phase 2.3 — Interpret NL → filters
-    # (rule-based for now; LLM later)
-    # -------------------------------
-    filters = {}
-
-    if "ib" in user_query:
-        if "35" in user_query:
-            filters["ib_min_12"] = 35
-        if "36" in user_query and "40" in user_query:
-            filters["ib_min_12"] = 36
-            filters["ib_max_12"] = 40
-
-    if "sat" in user_query:
-        if "1450" in user_query:
-            filters["SAT Total score_min"] = 1450
-
-    if "act" in user_query:
-        if "30" in user_query:
-            filters["ACT Score_min"] = 30
-
-    if "georgia" in user_query:
-        filters["admitted univs"] = "Georgia"
-
-    if "usa" in user_query:
-        filters["countries applied to"] = "USA"
-
-    if "computer science" in user_query or "cs" in user_query:
-        filters["intended_major"] = "Computer Science"
-
-    # -------------------------------
-    # Phase 2.4 — Execute filters
+    # Execute filters safely
     # -------------------------------
     records = sheet.get_all_records()
     students = filter_students(records, filters)
