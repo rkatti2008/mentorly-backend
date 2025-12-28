@@ -2,6 +2,10 @@ from fastapi import FastAPI, Request, HTTPException
 import gspread, os, json
 from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
+from pydantic import BaseModel
+
+
+
 
 app = FastAPI()
 
@@ -22,6 +26,11 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
+
+
+class NLQuery(BaseModel):
+    query: str
+
 
 # -------------------------------
 # Helpers
@@ -153,4 +162,31 @@ async def get_students(request: Request):
     return {
         "count": len(results),
         "students": results
+    }
+
+
+@app.post("/nl_query")
+async def nl_query(payload: NLQuery):
+    """
+    Temporary Phase-2 endpoint.
+    Converts NL → filters (stubbed for now).
+    """
+
+    user_query = payload.query.lower()
+
+    # 🔹 TEMP RULE-BASED PARSER (no LLM yet)
+    filters = {}
+
+    if "ib" in user_query:
+        filters["ib_min_12"] = 35
+
+    if "georgia" in user_query:
+        filters["admitted univs"] = "Georgia"
+
+    if "computer science" in user_query:
+        filters["intended_major"] = "Computer Science"
+
+    return {
+        "interpreted_filters": filters,
+        "note": "LLM not wired yet — rule based Phase 2.1"
     }
