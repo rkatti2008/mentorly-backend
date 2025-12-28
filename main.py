@@ -85,37 +85,24 @@ def filter_students(records, query_params):
         # ---- IB FILTER (explicit, safe) ----
         if "ib_min_12" in query_params or "ib_max_12" in query_params:
             if r.get("12th Board", "").strip().upper() != "IBDP":
-                include = False
-            else:
-                min_ib = query_params.get("ib_min_12")
-                max_ib = query_params.get("ib_max_12")
+                continue  # immediately skip non-IB students
 
-                try:
-                    min_ib = int(min_ib) if min_ib is not None else None
-                    max_ib = int(max_ib) if max_ib is not None else None
-                except ValueError:
-                    include = False
-                    continue
+            min_ib = query_params.get("ib_min_12")
+            max_ib = query_params.get("ib_max_12")
+
+            try:
+                min_ib = int(min_ib) if min_ib is not None else None
+                max_ib = int(max_ib) if max_ib is not None else None
+            except ValueError:
+                continue
 
             if not passes_numeric_filter(
-               r.get("12th grade overall score"),
-                     min_ib,
-                     max_ib,
-               ):
-               include = False
-
-
-        if not include:
-            continue
-
-        # ---- SAT FILTER ----
-        if "SAT Total score_min" in query_params or "SAT Total score_max" in query_params:
-            if not passes_numeric_filter(
-                r.get("SAT Total score"),
-                query_params.get("SAT Total score_min"),
-                query_params.get("SAT Total score_max"),
+                r.get("12th grade overall score"),
+                min_ib,
+                max_ib,
             ):
                 continue
+
 
         # ---- ACT FILTER ----
         if "ACT Score_min" in query_params or "ACT Score_max" in query_params:
