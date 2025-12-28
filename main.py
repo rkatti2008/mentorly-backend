@@ -31,6 +31,8 @@ sheet = client.open_by_key(SHEET_ID).sheet1
 class NLQuery(BaseModel):
     query: str
 
+class ChatRequest(BaseModel):
+    message: str
 
 # -------------------------------
 # Helpers
@@ -182,7 +184,7 @@ Return format:
 }}
 """
 
-    # 🔹 CALL YOUR LLM HERE (example placeholder)
+    #  CALL YOUR LLM HERE (example placeholder)
     llm_response = call_llm(prompt)   # ← your existing LLM call
 
     try:
