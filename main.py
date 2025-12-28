@@ -164,6 +164,22 @@ async def get_students(request: Request):
         "students": results
     }
 
+def call_llm(prompt: str) -> str:
+    """
+    TEMPORARY stub for Phase 2.2.
+    This will be replaced with real LLM integration later.
+    """
+
+    # Very naive rule-based fallback (for now)
+    if "Georgia" in prompt:
+        return json.dumps({
+            "filters": {
+                "admitted univs": "Georgia"
+            }
+        })
+
+    return json.dumps({"filters": {}})
+
 
 def llm_to_filters(nl_query: str) -> dict:
     """
