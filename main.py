@@ -35,6 +35,39 @@ if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("OPENAI_API_KEY not set")
 
 # -------------------------------
+# Phase 3.1 — Canonical maps
+# -------------------------------
+
+COUNTRY_CANONICAL = {
+    "america": "usa",
+    "united states": "usa",
+    "united states of america": "usa",
+    "us": "usa",
+    "amrika": "usa",
+    "u.s.": "usa",
+
+    "uk": "united kingdom",
+    "u.k.": "united kingdom",
+    "england": "united kingdom",
+}
+
+MAJOR_CANONICAL = {
+    "cs": "computer science",
+    "comp sci": "computer science",
+    "computer sciences": "computer science",
+
+    "ai": "artificial intelligence",
+    "artificial intel": "artificial intelligence",
+}
+
+UNIV_CANONICAL = {
+    "gatech": "georgia tech",
+    "georgia institute of technology": "georgia tech",
+}
+
+
+
+# -------------------------------
 # Models
 # -------------------------------
 class ChatRequest(BaseModel):
@@ -171,6 +204,38 @@ def filter_students(records, query_params):
 
     return filtered
 
+# -------------------------------
+# Phase 3.2 — Filter normalization
+# -------------------------------
+
+def normalize_filters(filters: dict) -> dict:
+    """
+    Normalize interpreted filters using canonical maps.
+    This does NOT apply filtering — only value normalization.
+    """
+    normalized = {}
+
+    for key, value in filters.items():
+        if value is None:
+            continue
+
+        v = str(value).strip().lower()
+
+        # Country normalization
+        if key.lower() in ["countries applied to"]:
+            v = COUNTRY_CANONICAL.get(v, v)
+
+        # Intended major normalization
+        elif key.lower() == "intended_major":
+            v = MAJOR_CANONICAL.get(v, v)
+
+        # University normalization
+        elif key.lower() in ["admitted univs", "rejected univs"]:
+            v = UNIV_CANONICAL.get(v, v)
+
+        normalized[key] = v
+
+    return normalized
 
 # -------------------------------
 # GET /students
@@ -267,6 +332,10 @@ async def nl_query(req: ChatRequest):
         
         try:
             filters = json.loads(json_str)
+            
+            # Phase 3.3 — normalize LLM filters        
+            filters = normalize_filters(filters)
+            
         except json.JSONDecodeError:
             raise HTTPException(
                 status_code=400,
