@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
 import gspread, os, json
 from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
@@ -33,17 +32,28 @@ def to_int(val):
     except (TypeError, ValueError):
         return None
 
-def fuzzy_match(text, query, threshold=0.65):
+def fuzzy_match(text, query, threshold=0.6):
     if not text or not query:
         return False
+
     text = text.lower()
     query = query.lower()
 
-    # Strong substring check first
     if query in text:
         return True
 
     return SequenceMatcher(None, text, query).ratio() >= threshold
+
+# -------------------------------
+# Query → Sheet column mapping
+# -------------------------------
+TEXT_COLUMN_MAP = {
+    "admitted univs": "Admitted Univs",
+    "rejected univs": "Rejected Univs",
+    "countries applied to": "Countries Applied To",
+    "intended_major": "Intended Major",
+    "city": "City of Graduation",
+}
 
 # -------------------------------
 # /students endpoint
@@ -70,7 +80,7 @@ async def get_students(request: Request):
         include = True
 
         # -------------------------------
-        # IB FILTER (LOCKED)
+        # IB FILTER (locked)
         # -------------------------------
         if "ib_min_12" in params or "ib_max_12" in params:
             if r.get("12th Board", "").strip().upper() != "IBDP":
@@ -93,9 +103,8 @@ async def get_students(request: Request):
                 continue
 
             col = k.rsplit("_", 1)[0]
-
             if col.startswith("ib"):
-                continue  # already handled above
+                continue
 
             val = to_int(r.get(col))
             if val is None:
@@ -113,28 +122,28 @@ async def get_students(request: Request):
             continue
 
         # -------------------------------
-        # TEXT FILTERS
+        # TEXT FILTERS (FIXED)
         # -------------------------------
         for k, v in params.items():
             if k.endswith("_min") or k.endswith("_max"):
                 continue
 
-            # Intended Major (multi-value)
-            if k.lower() == "intended_major":
+            key = k.lower()
+
+            if key == "intended_major":
                 majors = [m.strip() for m in v.split(",")]
                 if not any(fuzzy_match(r.get("Intended Major", ""), m) for m in majors):
                     include = False
                     break
 
-            # City (exact)
-            elif k.lower() == "city":
+            elif key == "city":
                 if r.get("City of Graduation", "").lower() != v.lower():
                     include = False
                     break
 
-            # Universities (LOCKED fuzzy logic)
-            elif k.lower() in ["admitted univs", "rejected univs", "countries applied to"]:
-                if not fuzzy_match(r.get(k, ""), v):
+            elif key in ["admitted univs", "rejected univs", "countries applied to"]:
+                sheet_col = TEXT_COLUMN_MAP[key]
+                if not fuzzy_match(r.get(sheet_col, ""), v):
                     include = False
                     break
 
