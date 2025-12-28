@@ -13,16 +13,20 @@ app = FastAPI()
 # -------------------------------
 # Google Sheets Setup
 # -------------------------------
-SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
-if not SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("SERVICE_ACCOUNT_JSON not set")
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
+
+if not SHEET_ID:
+    raise RuntimeError("SHEET_ID not set")
 
 creds = Credentials.from_service_account_info(
-    json.loads(SERVICE_ACCOUNT_JSON),
+    json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
     scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
 )
+
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
 
@@ -32,13 +36,13 @@ sheet = client.open_by_key(SHEET_ID).sheet1
 llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # -------------------------------
-# Request models
+# Request Models
 # -------------------------------
 class NLQueryRequest(BaseModel):
     query: str
 
 # -------------------------------
-# Helper functions
+# Helper Functions
 # -------------------------------
 def passes_numeric_filter(value_raw, min_val=None, max_val=None):
     try:
@@ -60,7 +64,11 @@ def fuzzy_match(text, patterns, threshold=0.7, multiple=False):
         return False
 
     text = str(text).lower()
-    patterns = [p.strip().lower() for p in str(patterns).split(",")] if multiple else [str(patterns).lower()]
+    patterns = (
+        [p.strip().lower() for p in str(patterns).split(",")]
+        if multiple
+        else [str(patterns).lower()]
+    )
 
     for pattern in patterns:
         if pattern in text:
@@ -73,17 +81,17 @@ def fuzzy_match(text, patterns, threshold=0.7, multiple=False):
 
 def extract_json_from_llm(text: str) -> dict:
     """
-    Extract first valid JSON object from LLM output
+    Safely extract the first JSON object from LLM output
     """
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        raise ValueError("No JSON object found")
+        raise ValueError("No JSON found")
 
     return json.loads(match.group())
 
 
 # -------------------------------
-# /students endpoint
+# /students Endpoint (FROZEN)
 # -------------------------------
 @app.get("/students")
 async def get_students(request: Request):
@@ -94,8 +102,14 @@ async def get_students(request: Request):
     sat_keys = ["SAT Total score", "SAT Math", "SAT English"]
     act_keys = ["ACT Score"]
 
-    sat_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in sat_keys)
-    act_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in act_keys)
+    sat_filter = any(
+        f"{k}_min" in query_params or f"{k}_max" in query_params
+        for k in sat_keys
+    )
+    act_filter = any(
+        f"{k}_min" in query_params or f"{k}_max" in query_params
+        for k in act_keys
+    )
 
     if sat_filter and act_filter:
         raise HTTPException(
@@ -112,7 +126,7 @@ async def get_students(request: Request):
                 min_val = int(query_params.get(f"{col}_min")) if f"{col}_min" in query_params else None
                 max_val = int(query_params.get(f"{col}_max")) if f"{col}_max" in query_params else None
 
-                # IB logic
+                # IB handling
                 if col.lower().startswith("ib"):
                     if r.get("12th Board", "").strip().upper() != "IBDP":
                         include = False
@@ -122,6 +136,7 @@ async def get_students(request: Request):
                 if not passes_numeric_filter(r.get(col), min_val, max_val):
                     include = False
                     break
+
             else:
                 if key.lower() == "intended_major":
                     if not fuzzy_match(r.get("Intended Major"), value, multiple=True):
@@ -155,15 +170,14 @@ async def get_students(request: Request):
 @app.post("/nl_query")
 async def nl_query(req: NLQueryRequest):
     system_prompt = """
-You convert user queries into filter JSON for a students API.
+You convert user queries into JSON filters for the /students API.
 
 Rules:
 - Output ONLY valid JSON
-- No explanation
-- Use keys exactly as API expects
+- No explanations
 - SAT and ACT are mutually exclusive
 - IB filters use keys like ib_min_12, ib_max_12
-- Intended majors should be comma-separated if multiple
+- Intended majors should be comma-separated
 """
 
     completion = llm.chat.completions.create(
