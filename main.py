@@ -97,7 +97,7 @@ def filter_students(records, query_params):
                     include = False
                     continue
 
-           if not passes_numeric_filter(
+            if not passes_numeric_filter(
                r.get("12th grade overall score"),
                      min_ib,
                      max_ib,
