@@ -90,12 +90,20 @@ def filter_students(records, query_params):
                 min_ib = query_params.get("ib_min_12")
                 max_ib = query_params.get("ib_max_12")
 
-                if not passes_numeric_filter(
-                    r.get("12th grade overall score"),
-                    min_ib,
-                    max_ib,
-                ):
+                try:
+                    min_ib = int(min_ib) if min_ib is not None else None
+                    max_ib = int(max_ib) if max_ib is not None else None
+                except ValueError:
                     include = False
+                    continue
+
+               if not passes_numeric_filter(
+                   r.get("12th grade overall score"),
+                         min_ib,
+                         max_ib,
+                   ):
+                   include = False
+
 
         if not include:
             continue
