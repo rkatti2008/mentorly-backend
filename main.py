@@ -64,22 +64,18 @@ TEXT_COLUMN_MAP = {
     "city": "City of Graduation",
 }
 
-# -------------------------------
-# /students endpoint
-# -------------------------------
-@app.get("/students")
-async def get_students(request: Request):
-    records = sheet.get_all_records()
-    params = dict(request.query_params)
-    results = []
 
-    # -------------------------------
-    # SAT / ACT mutual exclusion
-    # -------------------------------
-    sat_used = any(k.startswith("SAT") for k in params)
-    act_used = any(k.startswith("ACT") for k in params)
+def filter_students(records, query_params):
+    filtered = []
 
-    if sat_used and act_used:
+    # Detect SAT and ACT range filters
+    sat_keys = ["SAT Total score", "SAT Math", "SAT English"]
+    act_keys = ["ACT Score"]
+
+    sat_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in sat_keys)
+    act_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in act_keys)
+
+    if sat_filter and act_filter:
         raise HTTPException(
             status_code=400,
             detail="Please filter using either SAT or ACT, not both."
@@ -88,80 +84,56 @@ async def get_students(request: Request):
     for r in records:
         include = True
 
-        # -------------------------------
-        # IB FILTER (locked)
-        # -------------------------------
-        if "ib_min_12" in params or "ib_max_12" in params:
-            if r.get("12th Board", "").strip().upper() != "IBDP":
-                continue
+        for key, value in query_params.items():
+            if key.endswith("_min") or key.endswith("_max"):
+                col = key.rsplit("_", 1)[0]
+                min_val = int(query_params.get(f"{col}_min")) if f"{col}_min" in query_params else None
+                max_val = int(query_params.get(f"{col}_max")) if f"{col}_max" in query_params else None
 
-            ib_score = to_int(r.get("12th grade overall score"))
-            if ib_score is None:
-                continue
+                if col.lower().startswith("ib"):
+                    if r.get("12th Board", "").strip().upper() != "IBDP":
+                        include = False
+                        break
+                    col = "12th grade overall score"
 
-            if "ib_min_12" in params and ib_score < int(params["ib_min_12"]):
-                continue
-            if "ib_max_12" in params and ib_score > int(params["ib_max_12"]):
-                continue
-
-        # -------------------------------
-        # Numeric filters (SAT / ACT)
-        # -------------------------------
-        for k, v in params.items():
-            if not (k.endswith("_min") or k.endswith("_max")):
-                continue
-
-            col = k.rsplit("_", 1)[0]
-            if col.startswith("ib"):
-                continue
-
-            val = to_int(r.get(col))
-            if val is None:
-                include = False
-                break
-
-            if k.endswith("_min") and val < int(v):
-                include = False
-                break
-            if k.endswith("_max") and val > int(v):
-                include = False
-                break
-
-        if not include:
-            continue
-
-        # -------------------------------
-        # TEXT FILTERS (FIXED)
-        # -------------------------------
-        for k, v in params.items():
-            if k.endswith("_min") or k.endswith("_max"):
-                continue
-
-            key = k.lower()
-
-            if key == "intended_major":
-                majors = [m.strip() for m in v.split(",")]
-                if not any(fuzzy_match(r.get("Intended Major", ""), m) for m in majors):
+                if not passes_numeric_filter(r.get(col), min_val, max_val):
                     include = False
                     break
-
-            elif key == "city":
-                if r.get("City of Graduation", "").lower() != v.lower():
-                    include = False
-                    break
-
-            elif key in ["admitted univs", "rejected univs", "countries applied to"]:
-                sheet_col = TEXT_COLUMN_MAP[key]
-                if not fuzzy_match(r.get(sheet_col, ""), v):
-                    include = False
-                    break
+            else:
+                if key.lower() == "intended_major":
+                    if not fuzzy_match(r.get("Intended Major"), value, multiple=True):
+                        include = False
+                        break
+                elif key.lower() == "city":
+                    if value.lower() != str(r.get("City of Graduation", "")).lower():
+                        include = False
+                        break
+                else:
+                    if not fuzzy_match(r.get(key), value):
+                        include = False
+                        break
 
         if include:
-            results.append(r)
+            filtered.append(r)
+
+    return filtered
+
+
+
+
+# -------------------------------
+# /students endpoint
+# -------------------------------
+@app.get("/students")
+async def get_students(request: Request):
+    records = sheet.get_all_records()
+    query_params = dict(request.query_params)
+
+    filtered = filter_students(records, query_params)
 
     return {
-        "count": len(results),
-        "students": results
+        "count": len(filtered),
+        "students": filtered
     }
 
 def call_llm(prompt: str) -> str:
@@ -221,17 +193,24 @@ Return format:
 
 
 @app.post("/nl_query")
-async def nl_query(payload: NLQuery):
-    try:
-        filters = llm_to_filters(payload.query)
+async def nl_query(req: ChatRequest):
+    nl = req.message.lower()
 
-        return {
-            "interpreted_filters": filters,
-            "note": "Generated by LLM"
-        }
+    # Phase 2.1/2.2 logic (existing)
+    filters = {}
 
-    except ValueError as e:
-        return {
-            "error": str(e),
-            "hint": "Try rephrasing your query"
-        }
+    if "ib" in nl and "35" in nl:
+        filters["ib_min_12"] = 35
+    if "georgia" in nl:
+        filters["admitted univs"] = "Georgia"
+    if "computer" in nl:
+        filters["intended_major"] = "Computer Science"
+
+    records = sheet.get_all_records()
+    students = filter_students(records, filters)
+
+    return {
+        "interpreted_filters": filters,
+        "count": len(students),
+        "students": students
+    }
