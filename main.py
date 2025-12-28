@@ -1,46 +1,50 @@
-import os
-import json
-import urllib.parse
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
+import os
+import json
+import re
 from openai import OpenAI
 
 app = FastAPI()
 
-# =====================================================
+# -------------------------------
 # Google Sheets Setup
-# =====================================================
-SHEET_ID = "1lItXDgWdnngFQL_zBxSD4dOBlnwInll698UX6o4bX3A"
+# -------------------------------
+SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
+SHEET_ID = os.environ.get("SHEET_ID")
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-
-# Service account from environment variable (Render-safe)
-service_account_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+if not SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("SERVICE_ACCOUNT_JSON not set")
 
 creds = Credentials.from_service_account_info(
-    service_account_info, scopes=SCOPES
+    json.loads(SERVICE_ACCOUNT_JSON),
+    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
 )
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
 
-
-# =====================================================
+# -------------------------------
 # OpenAI Client
-# =====================================================
-llm_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# -------------------------------
+llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+# -------------------------------
+# Request models
+# -------------------------------
+class NLQueryRequest(BaseModel):
+    query: str
 
-# =====================================================
-# Helper Functions
-# =====================================================
+# -------------------------------
+# Helper functions
+# -------------------------------
 def passes_numeric_filter(value_raw, min_val=None, max_val=None):
     try:
         value = int(value_raw)
     except (TypeError, ValueError):
-        return False
+        return False if (min_val is not None or max_val is not None) else True
 
     if min_val is not None and value < min_val:
         return False
@@ -49,14 +53,14 @@ def passes_numeric_filter(value_raw, min_val=None, max_val=None):
     return True
 
 
-def fuzzy_match(text, patterns, threshold=0.7):
+def fuzzy_match(text, patterns, threshold=0.7, multiple=False):
     if patterns is None:
         return True
     if text is None:
         return False
 
     text = str(text).lower()
-    patterns = [p.strip().lower() for p in str(patterns).split(",")]
+    patterns = [p.strip().lower() for p in str(patterns).split(",")] if multiple else [str(patterns).lower()]
 
     for pattern in patterns:
         if pattern in text:
@@ -67,39 +71,33 @@ def fuzzy_match(text, patterns, threshold=0.7):
     return False
 
 
-# =====================================================
-# Filter whitelist (CRITICAL SAFETY)
-# =====================================================
-ALLOWED_FILTERS = {
-    "city": "City of Graduation",
-    "intended_major": "Intended Major",
-    "sat_min": "SAT Total score",
-    "sat_max": "SAT Total score",
-    "act_min": "ACT Score",
-    "act_max": "ACT Score",
-    "ib_min_12": "12th grade overall score",
-    "ib_max_12": "12th grade overall score",
-    "countries applied to": "Countries Applied To",
-    "admitted univs": "Admitted Univs",
-    "rejected univs": "Rejected Univs"
-}
+def extract_json_from_llm(text: str) -> dict:
+    """
+    Extract first valid JSON object from LLM output
+    """
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found")
+
+    return json.loads(match.group())
 
 
-# =====================================================
-# /students endpoint (AUTHORITATIVE)
-# =====================================================
+# -------------------------------
+# /students endpoint
+# -------------------------------
 @app.get("/students")
 async def get_students(request: Request):
     records = sheet.get_all_records()
     filtered = []
-
     query_params = dict(request.query_params)
 
-    # SAT vs ACT mutual exclusion
-    sat_used = any(k.startswith("sat_") for k in query_params)
-    act_used = any(k.startswith("act_") for k in query_params)
+    sat_keys = ["SAT Total score", "SAT Math", "SAT English"]
+    act_keys = ["ACT Score"]
 
-    if sat_used and act_used:
+    sat_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in sat_keys)
+    act_filter = any(f"{k}_min" in query_params or f"{k}_max" in query_params for k in act_keys)
+
+    if sat_filter and act_filter:
         raise HTTPException(
             status_code=400,
             detail="Please filter using either SAT or ACT, not both."
@@ -109,42 +107,36 @@ async def get_students(request: Request):
         include = True
 
         for key, value in query_params.items():
-            # -------------------------
-            # Numeric filters
-            # -------------------------
             if key.endswith("_min") or key.endswith("_max"):
-                base = key.rsplit("_", 1)[0]
-
-                min_val = query_params.get(f"{base}_min")
-                max_val = query_params.get(f"{base}_max")
-
-                min_val = int(min_val) if min_val is not None else None
-                max_val = int(max_val) if max_val is not None else None
+                col = key.rsplit("_", 1)[0]
+                min_val = int(query_params.get(f"{col}_min")) if f"{col}_min" in query_params else None
+                max_val = int(query_params.get(f"{col}_max")) if f"{col}_max" in query_params else None
 
                 # IB logic
-                if base.startswith("ib"):
+                if col.lower().startswith("ib"):
                     if r.get("12th Board", "").strip().upper() != "IBDP":
                         include = False
                         break
                     col = "12th grade overall score"
-                else:
-                    col = ALLOWED_FILTERS.get(key) or ALLOWED_FILTERS.get(base)
 
                 if not passes_numeric_filter(r.get(col), min_val, max_val):
                     include = False
                     break
-
-            # -------------------------
-            # Text filters
-            # -------------------------
             else:
-                if key == "city":
+                if key.lower() == "intended_major":
+                    if not fuzzy_match(r.get("Intended Major"), value, multiple=True):
+                        include = False
+                        break
+                elif key.lower() == "city":
                     if value.lower() != str(r.get("City of Graduation", "")).lower():
                         include = False
                         break
+                elif key.lower() in ["countries applied to", "admitted univs", "rejected univs"]:
+                    if not fuzzy_match(r.get(key), value):
+                        include = False
+                        break
                 else:
-                    col = ALLOWED_FILTERS.get(key)
-                    if col and not fuzzy_match(r.get(col), value):
+                    if not fuzzy_match(r.get(key), value):
                         include = False
                         break
 
@@ -157,65 +149,43 @@ async def get_students(request: Request):
     }
 
 
-# =====================================================
-# Natural Language → Query Builder
-# =====================================================
-class NLQuery(BaseModel):
-    query: str
-
-
+# -------------------------------
+# Phase 2 – Natural Language Query
+# -------------------------------
 @app.post("/nl_query")
-async def nl_query(req: NLQuery):
-    """
-    Converts natural language to structured /students filters
-    """
+async def nl_query(req: NLQueryRequest):
+    system_prompt = """
+You convert user queries into filter JSON for a students API.
 
-    prompt = f"""
-You are a STRICT query parser.
-
-Convert the user query into VALID JSON using ONLY the allowed filters.
 Rules:
-- Use only keys from the allowed list
+- Output ONLY valid JSON
+- No explanation
+- Use keys exactly as API expects
 - SAT and ACT are mutually exclusive
-- IB filters apply only to IBDP students
-- Use integers for numeric filters
-- Use comma-separated strings for text filters
-- Output ONLY JSON
-
-Allowed filters:
-{list(ALLOWED_FILTERS.keys())}
-
-User query:
-"{req.query}"
+- IB filters use keys like ib_min_12, ib_max_12
+- Intended majors should be comma-separated if multiple
 """
 
-    response = llm_client.chat.completions.create(
+    completion = llm.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": req.query}
+        ]
     )
+
+    raw_text = completion.choices[0].message.content
 
     try:
-        filters = json.loads(response.choices[0].message.content)
+        filters = extract_json_from_llm(raw_text)
     except Exception:
-        raise HTTPException(status_code=400, detail="LLM output could not be parsed")
-
-    # Enforce whitelist
-    filters = {k: v for k, v in filters.items() if k in ALLOWED_FILTERS}
-
-    # Call students logic internally
-    request_scope = Request(
-        scope={
-            "type": "http",
-            "query_string": urllib.parse.urlencode(filters).encode()
-        }
-    )
-
-    result = await get_students(request_scope)
+        raise HTTPException(
+            status_code=400,
+            detail="LLM output could not be parsed"
+        )
 
     return {
         "interpreted_filters": filters,
-        "generated_query": f"/students?{urllib.parse.urlencode(filters)}",
-        "count": result["count"],
-        "students": result["students"]
+        "students_endpoint": "/students",
+        "query_params": filters
     }
