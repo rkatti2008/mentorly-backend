@@ -228,13 +228,7 @@ def normalize_filters(filters: dict) -> dict:
         "comp sci": "computer science",
         "cse": "computer science"
     }
-    if "countries applied to" in filters:
-        val = filters["countries applied to"]
-        if isinstance(val, str):
-            v = val.lower().strip()
-            if v in COUNTRY_SYNONYMS:
-                filters["countries applied to"] = COUNTRY_SYNONYMS[v]
-                
+
     for key, val in filters.items():
         if isinstance(val, str):
             v = val.strip().lower()
@@ -248,12 +242,12 @@ def normalize_filters(filters: dict) -> dict:
                 v = MAJOR_SYNONYMS.get(v, v)
 
             normalized[key] = v
-
         else:
             # numeric values stay as-is
             normalized[key] = val
 
     return normalized
+
 
 
 
