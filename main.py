@@ -277,6 +277,27 @@ async def get_students(request: Request):
         "students": students
     }
 
+def repair_llm_filters(filters: dict) -> dict:
+    """
+    Fix common LLM semantic mistakes before normalization.
+    """
+    repaired = dict(filters)
+
+    COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
+
+    # Fix: country wrongly placed under admitted univs
+    if "admitted univs" in repaired:
+        val = str(repaired["admitted univs"]).lower().strip()
+        if val in COUNTRY_WORDS:
+            repaired.pop("admitted univs")
+            repaired["countries applied to"] = val
+
+    # Fix: hallucinated IB score
+    if "ib_min_12" in repaired and "ib" not in repaired:
+        # user never mentioned IB explicitly
+        repaired.pop("ib_min_12")
+
+    return repaired
 
 
 @app.post("/nl_query")
@@ -366,6 +387,9 @@ async def nl_query(req: ChatRequest):
         
         try:
             filters = json.loads(json_str)
+            
+            # Phase 3.4.3 repair LLM mistakes
+            filters = repair_llm_filters(filters)
             
             # Phase 3.4 — normalize LLM filters        
             filters = normalize_filters(filters)
