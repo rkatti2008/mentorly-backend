@@ -299,7 +299,18 @@ async def nl_query(req: ChatRequest):
         - Use numbers for numeric values
         - Use strings for text values
         - Omit keys not mentioned in the query
+        
+        Domain mappings:
+        - "CS", "CompSci", "Computer Science", "CSE" → intended_major = "computer science"
+        - "Engineering" → intended_major = "engineering"
+        - "Business", "BBA", "Management" → intended_major = "business"
+        - "Economics", "Econ" → intended_major = "economics"
 
+        Rules for majors:
+        - If a field of study is mentioned, ALWAYS emit intended_major
+        - Abbreviations MUST be expanded
+        - intended_major must be lowercase
+     
     User query:
         "{req.message}"
     """
