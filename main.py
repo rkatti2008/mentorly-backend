@@ -228,7 +228,13 @@ def normalize_filters(filters: dict) -> dict:
         "comp sci": "computer science",
         "cse": "computer science"
     }
-
+    if "countries applied to" in filters:
+        val = filters["countries applied to"]
+        if isinstance(val, str):
+            v = val.lower().strip()
+            if v in COUNTRY_SYNONYMS:
+                filters["countries applied to"] = COUNTRY_SYNONYMS[v]
+                
     for key, val in filters.items():
         if isinstance(val, str):
             v = val.strip().lower()
@@ -313,6 +319,15 @@ async def nl_query(req: ChatRequest):
         - Use numbers for numeric values
         - Use strings for text values
         - Omit keys not mentioned in the query
+        
+        Rules for IB:
+        - Phrases like "IB students" or "IBDP students" mean the student board is IB
+        - If no IB score is mentioned, emit ib_min_12 = 1
+        
+        Geography rules:
+        - If a place name matches a known university name, prefer admitted univs
+        - "Georgia" alone should map to admitted univs unless explicitly stated as country
+        - Countries must be explicit (e.g. "country Georgia")
         
         Domain mappings:
         - "CS", "CompSci", "Computer Science", "CSE" → intended_major = "computer science"
