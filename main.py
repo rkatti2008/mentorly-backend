@@ -205,37 +205,51 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Phase 3.2 — Filter normalization
+# Phase 3.4 — Filter normalization
 # -------------------------------
 
 def normalize_filters(filters: dict) -> dict:
     """
-    Normalize interpreted filters using canonical maps.
-    This does NOT apply filtering — only value normalization.
+    Normalize LLM-produced filters so downstream filtering is stable.
     """
     normalized = {}
 
-    for key, value in filters.items():
-        if value is None:
-            continue
+    COUNTRY_SYNONYMS = {
+        "america": "usa",
+        "amrika": "usa",
+        "united states": "usa",
+        "united states of america": "usa",
+        "us": "usa",
+        "u.s.": "usa"
+    }
 
-        v = str(value).strip().lower()
+    MAJOR_SYNONYMS = {
+        "cs": "computer science",
+        "comp sci": "computer science",
+        "cse": "computer science"
+    }
 
-        # Country normalization
-        if key.lower() in ["countries applied to"]:
-            v = COUNTRY_CANONICAL.get(v, v)
+    for key, val in filters.items():
+        if isinstance(val, str):
+            v = val.strip().lower()
 
-        # Intended major normalization
-        elif key.lower() == "intended_major":
-            v = MAJOR_CANONICAL.get(v, v)
+            # ---- country normalization ----
+            if key == "countries applied to":
+                v = COUNTRY_SYNONYMS.get(v, v)
 
-        # University normalization
-        elif key.lower() in ["admitted univs", "rejected univs"]:
-            v = UNIV_CANONICAL.get(v, v)
+            # ---- major normalization ----
+            if key == "intended_major":
+                v = MAJOR_SYNONYMS.get(v, v)
 
-        normalized[key] = v
+            normalized[key] = v
+
+        else:
+            # numeric values stay as-is
+            normalized[key] = val
 
     return normalized
+
+
 
 # -------------------------------
 # GET /students
@@ -344,9 +358,22 @@ async def nl_query(req: ChatRequest):
         try:
             filters = json.loads(json_str)
             
-            # Phase 3.3 — normalize LLM filters        
+            # Phase 3.4 — normalize LLM filters        
             filters = normalize_filters(filters)
             
+            # -------------------------------
+            # Phase 3.4.3 — Dropped-intent guard
+            # -------------------------------
+            query_lower = req.message.lower()
+
+            # Major intent mentioned but not captured
+            if any(token in query_lower for token in ["cs", "computer", "engineering", "business", "economics"]):
+                if "intended_major" not in filters:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Query mentions a field of study but no intended_major filter was detected."
+                    )
+       
         except json.JSONDecodeError:
             raise HTTPException(
                 status_code=400,
