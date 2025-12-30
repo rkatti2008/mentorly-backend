@@ -41,7 +41,6 @@ creds = Credentials.from_service_account_info(
 )
 
 client = gspread.authorize(creds)
-sheet = client.open_by_key(SHEET_ID).sheet1
 
 if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("OPENAI_API_KEY not set")
@@ -96,8 +95,9 @@ def get_column_value(row: dict, key: str):
 def filter_students(records, query_params):
     filtered = []
 
-    sat_used = any(k.startswith("SAT") for k in query_params)
-    act_used = any(k.startswith("ACT") for k in query_params)
+    # ✅ Only raise error if numeric filters for both SAT and ACT exist
+    sat_used = "SAT Total score_min" in query_params or "SAT Total score_max" in query_params
+    act_used = "ACT Score_min" in query_params or "ACT Score_max" in query_params
 
     if sat_used and act_used:
         raise HTTPException(
@@ -204,7 +204,7 @@ def normalize_filters(filters: dict) -> dict:
     return normalized
 
 # -------------------------------
-# Phase 3.4.3 — Repair LLM mistakes (FIXED)
+# Phase 3.4.3 — Repair LLM mistakes (IB and numeric guards)
 # -------------------------------
 def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
@@ -219,15 +219,15 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
 
     query_lower = user_query.lower()
 
-    # ✅ Correct IB diploma defaults
+    # Correct IB diploma defaults
     if "ib" in query_lower:
         if "ib_min_12" not in repaired:
             repaired["ib_min_12"] = 24
         if "ib_max_12" not in repaired:
             repaired["ib_max_12"] = 45
 
-    # ✅ Guard against IB subject-grade hallucinations (1–7)
-    if repaired.get("ib_max_12") is not None and repaired["ib_max_12"] <= 7:
+    # Ensure IB numeric bounds are reasonable
+    if repaired.get("ib_max_12") is not None and repaired["ib_max_12"] < 24:
         repaired["ib_max_12"] = 45
     if repaired.get("ib_min_12") is not None and repaired["ib_min_12"] < 24:
         repaired["ib_min_12"] = 24
