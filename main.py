@@ -154,6 +154,7 @@ def filter_students(records, query_params):
             if val is None:
                 continue
 
+            # Intended major
             if key.lower() == "intended_major":
                 majors = [m.strip() for m in val.split(",")]
                 cell = get_column_value(r, "Intended Major")
@@ -161,8 +162,28 @@ def filter_students(records, query_params):
                     include = False
                     break
 
+            # City
             elif key.lower() == "city":
                 if r.get("City of Graduation", "").lower() != val.lower():
+                    include = False
+                    break
+
+            # Admitted universities (list)
+            elif key.lower() == "admitted univs":
+                cell = r.get("Accepted Univ", "")
+                if isinstance(val, list):
+                    if not any(fuzzy_match(cell, v) for v in val):
+                        include = False
+                        break
+                else:
+                    if not fuzzy_match(cell, val):
+                        include = False
+                        break
+
+            # Countries applied to
+            elif key.lower() == "countries applied to":
+                cell = r.get("Countries Applied To", "")
+                if not fuzzy_match(cell, val):
                     include = False
                     break
 
@@ -220,10 +241,17 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
 
     if "admitted univs" in repaired:
-        val = str(repaired["admitted univs"]).lower().strip()
-        if val in COUNTRY_WORDS:
+        val = repaired["admitted univs"]
+        # Normalize to list
+        if isinstance(val, str):
+            val = [val]
+        # Remove if it looks like a country
+        val_lower = [v.lower() for v in val]
+        if any(v in COUNTRY_WORDS for v in val_lower):
             repaired.pop("admitted univs")
-            repaired["countries applied to"] = val
+            repaired["countries applied to"] = val_lower[0]
+        else:
+            repaired["admitted univs"] = val
 
     query_lower = user_query.lower()
 
