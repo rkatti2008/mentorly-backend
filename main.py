@@ -22,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # -------------------------------
 # Google Sheets Setup
 # -------------------------------
@@ -51,7 +50,6 @@ if not os.environ.get("OPENAI_API_KEY"):
 # -------------------------------
 # Phase 3.1 — Canonical maps
 # -------------------------------
-
 COUNTRY_CANONICAL = {
     "america": "usa",
     "united states": "usa",
@@ -78,8 +76,6 @@ UNIV_CANONICAL = {
     "gatech": "georgia tech",
     "georgia institute of technology": "georgia tech",
 }
-
-
 
 # -------------------------------
 # Models
@@ -119,7 +115,6 @@ def fuzzy_match(text, pattern, threshold=0.7):
 def get_column_value(row: dict, key: str):
     """
     Case-insensitive + space-insensitive column lookup
-    Fixes fuzzy filter bugs for admitted univs, countries applied to, etc.
     """
     key_norm = key.lower().strip()
     for col in row:
@@ -134,7 +129,6 @@ def get_column_value(row: dict, key: str):
 def filter_students(records, query_params):
     filtered = []
 
-    # SAT / ACT mutual exclusion
     sat_used = any(k.startswith("SAT") for k in query_params)
     act_used = any(k.startswith("ACT") for k in query_params)
 
@@ -147,7 +141,6 @@ def filter_students(records, query_params):
     for r in records:
         include = True
 
-        # ---- IB FILTER ----
         if "ib_min_12" in query_params or "ib_max_12" in query_params:
             if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
@@ -168,7 +161,6 @@ def filter_students(records, query_params):
             ):
                 continue
 
-        # ---- SAT FILTER (FIXED) ----
         if "SAT Total score_min" in query_params or "SAT Total score_max" in query_params:
             if not passes_numeric_filter(
                 r.get("SAT Total score"),
@@ -177,7 +169,6 @@ def filter_students(records, query_params):
             ):
                 continue
 
-        # ---- ACT FILTER ----
         if "ACT Score_min" in query_params or "ACT Score_max" in query_params:
             if not passes_numeric_filter(
                 r.get("ACT Score"),
@@ -186,7 +177,6 @@ def filter_students(records, query_params):
             ):
                 continue
 
-        # ---- TEXT FILTERS ----
         for key, val in query_params.items():
             if key in [
                 "ib_min_12", "ib_max_12",
@@ -221,11 +211,7 @@ def filter_students(records, query_params):
 # -------------------------------
 # Phase 3.4 — Filter normalization
 # -------------------------------
-
 def normalize_filters(filters: dict) -> dict:
-    """
-    Normalize LLM-produced filters so downstream filtering is stable.
-    """
     normalized = {}
 
     COUNTRY_SYNONYMS = {
@@ -247,199 +233,165 @@ def normalize_filters(filters: dict) -> dict:
         if isinstance(val, str):
             v = val.strip().lower()
 
-            # ---- country normalization ----
             if key == "countries applied to":
                 v = COUNTRY_SYNONYMS.get(v, v)
 
-            # ---- major normalization ----
             if key == "intended_major":
                 v = MAJOR_SYNONYMS.get(v, v)
 
             normalized[key] = v
         else:
-            # numeric values stay as-is
             normalized[key] = val
 
     return normalized
 
-
-
-
 # -------------------------------
-# GET /students
+# Phase 3.4.3 — Repair LLM mistakes
 # -------------------------------
-@app.get("/students")
-async def get_students(request: Request):
-    records = sheet.get_all_records()
-    query_params = dict(request.query_params)
-
-    # Convert numeric params
-    for k in list(query_params.keys()):
-        if k.endswith("_min") or k.endswith("_max"):
-            try:
-                query_params[k] = int(query_params[k])
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid numeric value for {k}"
-                )
-
-    students = filter_students(records, query_params)
-
-    return {
-        "count": len(students),
-        "students": students
-    }
-
 def repair_llm_filters(filters: dict) -> dict:
-    """
-    Fix common LLM semantic mistakes before normalization.
-    """
     repaired = dict(filters)
 
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
 
-    # Fix: country wrongly placed under admitted univs
     if "admitted univs" in repaired:
         val = str(repaired["admitted univs"]).lower().strip()
         if val in COUNTRY_WORDS:
             repaired.pop("admitted univs")
             repaired["countries applied to"] = val
 
-    # Fix: hallucinated IB score
     if "ib_min_12" in repaired and "ib" not in repaired:
-        # user never mentioned IB explicitly
         repaired.pop("ib_min_12")
 
     return repaired
 
+# -------------------------------
+# Phase 5.1 — RAG Prompt Builder (NEW)
+# -------------------------------
+def build_rag_messages(user_question: str, rows: list):
+    system_prompt = """
+You are Mentorly, a college counseling assistant.
 
+You are given:
+1) A user question
+2) A set of student records retrieved from a database
+
+CRITICAL RULES:
+- You MUST use ONLY the provided student records.
+- You MUST NOT use any external knowledge, assumptions, or general advice.
+- If the provided records do not contain enough information to answer the question, say:
+  "Based on the available data, there is not enough information to answer this question."
+
+ALLOWED:
+- Summarizing patterns visible in the records
+- Counting, grouping, and comparing the records
+- Rephrasing the data in clear natural language
+
+FORBIDDEN:
+- Predicting outcomes not shown in the data
+- Recommending universities or strategies not present in the records
+- Giving advice beyond what the data directly supports
+
+OUTPUT FORMAT:
+- A concise paragraph (3–6 sentences)
+- Reference only information visible in the records
+"""
+
+    user_prompt = f"""
+User question:
+{user_question}
+
+Retrieved student records:
+{json.dumps(rows, indent=2)}
+
+Number of matching records:
+{len(rows)}
+"""
+
+    return [
+        {"role": "system", "content": system_prompt.strip()},
+        {"role": "user", "content": user_prompt.strip()}
+    ]
+
+# -------------------------------
+# POST /nl_query
+# -------------------------------
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
-    """
-    Natural language → LLM → filters → students
-    """
 
     prompt = f"""
-        You are a strict JSON generator.
+You are a strict JSON generator.
 
-        Your task:
-        Convert the user query into a JSON object of filters.
+Your task:
+Convert the user query into a JSON object of filters.
 
-        CRITICAL RULES:
-        - Output ONLY raw JSON
-        - Do NOT include markdown
-        - Do NOT include backticks
-        - Do NOT include explanations
-        - Do NOT include text before or after JSON
-        - JSON must start with {{ and end with }}
+CRITICAL RULES:
+- Output ONLY raw JSON
+- Do NOT include markdown
+- Do NOT include backticks
+- Do NOT include explanations
+- Do NOT include text before or after JSON
+- JSON must start with {{ and end with }}
 
-        Allowed keys ONLY:
-        ib_min_12, ib_max_12,
-        "SAT Total score_min", "SAT Total score_max",
-        "ACT Score_min", "ACT Score_max",
-        intended_major,
-        admitted univs,
-        countries applied to,
-        city
+Allowed keys ONLY:
+ib_min_12, ib_max_12,
+"SAT Total score_min", "SAT Total score_max",
+"ACT Score_min", "ACT Score_max",
+intended_major,
+admitted univs,
+countries applied to,
+city
 
-        Rules:
-        - SAT and ACT must NEVER both appear
-        - Use numbers for numeric values
-        - Use strings for text values
-        - Omit keys not mentioned in the query
-        
-        Rules for IB:
-        - Phrases like "IB students" or "IBDP students" mean the student board is IB
-        - If no IB score is mentioned, emit ib_min_12 = 1
-        
-        Geography rules:
-        - If a place name matches a known university name, prefer admitted univs
-        - "Georgia" alone should map to admitted univs unless explicitly stated as country
-        - Countries must be explicit (e.g. "country Georgia")
-        
-        Domain mappings:
-        - "CS", "CompSci", "Computer Science", "CSE" → intended_major = "computer science"
-        - "Engineering" → intended_major = "engineering"
-        - "Business", "BBA", "Management" → intended_major = "business"
-        - "Economics", "Econ" → intended_major = "economics"
+Rules:
+- SAT and ACT must NEVER both appear
+- Use numbers for numeric values
+- Use strings for text values
+- Omit keys not mentioned in the query
 
-        Rules for majors:
-        - If a field of study is mentioned, ALWAYS emit intended_major
-        - Abbreviations MUST be expanded
-        - intended_major must be lowercase
-     
-    User query:
-        "{req.message}"
-    """
-  
-    try:
-        response = client_llm.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
+Rules for IB:
+- Phrases like "IB students" or "IBDP students" mean the student board is IB
+- If no IB score is mentioned, emit ib_min_12 = 1
 
-        raw_output = response.choices[0].message.content.strip()
-        
-        # ---- SANITIZE LLM OUTPUT ----
-        if raw_output.startswith("```"):
-            raw_output = raw_output.strip("`")
-            raw_output = raw_output.replace("json", "", 1).strip()
-            
-            
-        # Remove accidental leading text
-        start = raw_output.find("{")
-        end = raw_output.rfind("}")
-        
-        if start == -1 or end == -1:
-            raise HTTPException(
-                status_code=400,
-                detail="LLM output did not contain JSON"
-            )
-        json_str = raw_output[start:end + 1]
-        
-        try:
-            filters = json.loads(json_str)
-            
-            # Phase 3.4.3 repair LLM mistakes
-            filters = repair_llm_filters(filters)
-            
-            # Phase 3.4 — normalize LLM filters        
-            filters = normalize_filters(filters)
-            
-            # -------------------------------
-            # Phase 3.4.3 — Dropped-intent guard
-            # -------------------------------
-            query_lower = req.message.lower()
+User query:
+"{req.message}"
+"""
 
-            # Major intent mentioned but not captured
-            if any(token in query_lower for token in ["cs", "computer", "engineering", "business", "economics"]):
-                if "intended_major" not in filters:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Query mentions a field of study but no intended_major filter was detected."
-                    )
-       
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400,
-                detail="LLM output could not be parsed"
-            )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+    response = client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
 
-    # -------------------------------
-    # Execute filters safely
-    # -------------------------------
+    raw_output = response.choices[0].message.content.strip()
+    start = raw_output.find("{")
+    end = raw_output.rfind("}")
+
+    if start == -1 or end == -1:
+        raise HTTPException(status_code=400, detail="LLM output did not contain JSON")
+
+    filters = json.loads(raw_output[start:end + 1])
+    filters = repair_llm_filters(filters)
+    filters = normalize_filters(filters)
+
     records = sheet.get_all_records()
     students = filter_students(records, filters)
+
+    # -------------------------------
+    # Phase 5.2 — RAG Answer Synthesis
+    # -------------------------------
+    if len(students) == 0:
+        assistant_answer = "No matching student records were found for your query."
+    else:
+        rag_messages = build_rag_messages(req.message, students)
+        rag_response = client_llm.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=rag_messages,
+            temperature=0
+        )
+        assistant_answer = rag_response.choices[0].message.content.strip()
 
     return {
         "interpreted_filters": filters,
         "count": len(students),
+        "assistant_answer": assistant_answer,
         "students": students
     }
