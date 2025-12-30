@@ -96,7 +96,7 @@ def get_column_value(row: dict, key: str):
 def filter_students(records, query_params):
     filtered = []
 
-    # --- FIX: Only consider SAT/ACT filters if actual numeric values are present ---
+    # Only consider SAT/ACT filters if actual numeric values are present
     sat_vals = [query_params.get("SAT Total score_min"), query_params.get("SAT Total score_max")]
     act_vals = [query_params.get("ACT Score_min"), query_params.get("ACT Score_max")]
 
@@ -112,21 +112,20 @@ def filter_students(records, query_params):
     for r in records:
         include = True
 
-        if "ib_min_12" in query_params or "ib_max_12" in query_params:
+        # IB filter
+        if query_params.get("ib_min_12") is not None or query_params.get("ib_max_12") is not None:
             if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
 
-            min_ib = query_params.get("ib_min_12")
-            max_ib = query_params.get("ib_max_12")
-
             if not passes_numeric_filter(
                 r.get("12th grade overall score"),
-                min_ib,
-                max_ib,
+                query_params.get("ib_min_12"),
+                query_params.get("ib_max_12"),
             ):
                 continue
 
-        if "SAT Total score_min" in query_params or "SAT Total score_max" in query_params:
+        # SAT filter
+        if sat_used:
             if not passes_numeric_filter(
                 r.get("SAT Total score"),
                 query_params.get("SAT Total score_min"),
@@ -134,7 +133,8 @@ def filter_students(records, query_params):
             ):
                 continue
 
-        if "ACT Score_min" in query_params or "ACT Score_max" in query_params:
+        # ACT filter
+        if act_used:
             if not passes_numeric_filter(
                 r.get("ACT Score"),
                 query_params.get("ACT Score_min"),
@@ -142,12 +142,16 @@ def filter_students(records, query_params):
             ):
                 continue
 
+        # Other filters
         for key, val in query_params.items():
             if key in [
                 "ib_min_12", "ib_max_12",
                 "SAT Total score_min", "SAT Total score_max",
                 "ACT Score_min", "ACT Score_max"
             ]:
+                continue
+
+            if val is None:
                 continue
 
             if key.lower() == "intended_major":
@@ -223,14 +227,14 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
 
     query_lower = user_query.lower()
 
-    # ✅ Correct IB diploma defaults
+    # Correct IB diploma defaults
     if "ib" in query_lower:
         if "ib_min_12" not in repaired:
             repaired["ib_min_12"] = 24
         if "ib_max_12" not in repaired:
             repaired["ib_max_12"] = 45
 
-    # ✅ Guard against IB subject-grade hallucinations (1–7)
+    # Guard against IB subject-grade hallucinations (1–7)
     if repaired.get("ib_max_12") is not None and repaired["ib_max_12"] <= 7:
         repaired["ib_max_12"] = 45
     if repaired.get("ib_min_12") is not None and repaired["ib_min_12"] < 24:
@@ -313,7 +317,7 @@ User query:
     filters = repair_llm_filters(filters, req.message)
     filters = normalize_filters(filters)
 
-    records = sheet.get_all_records()  
+    records = sheet.get_all_records()
     students = filter_students(records, filters)
 
     analytics = compute_analytics(students)
