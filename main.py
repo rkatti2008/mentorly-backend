@@ -7,6 +7,7 @@ from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
 import os
 import json
+import re
 
 app = FastAPI()
 
@@ -57,7 +58,6 @@ COUNTRY_CANONICAL = {
     "us": "usa",
     "amrika": "usa",
     "u.s.": "usa",
-
     "uk": "united kingdom",
     "u.k.": "united kingdom",
     "england": "united kingdom",
@@ -67,7 +67,6 @@ MAJOR_CANONICAL = {
     "cs": "computer science",
     "comp sci": "computer science",
     "computer sciences": "computer science",
-
     "ai": "artificial intelligence",
     "artificial intel": "artificial intelligence",
 }
@@ -113,15 +112,11 @@ def fuzzy_match(text, pattern, threshold=0.7):
 
 
 def get_column_value(row: dict, key: str):
-    """
-    Case-insensitive + space-insensitive column lookup
-    """
     key_norm = key.lower().strip()
     for col in row:
         if col.lower().strip() == key_norm:
             return row[col]
     return None
-
 
 # -------------------------------
 # Core filter engine (LOCKED)
@@ -265,9 +260,22 @@ def repair_llm_filters(filters: dict) -> dict:
     return repaired
 
 # -------------------------------
-# Phase 5.1 — RAG Prompt Builder (NEW)
+# Phase 5.1 — RAG Prompt Builder
 # -------------------------------
 def build_rag_messages(user_question: str, rows: list):
+    # Advice firewall keywords
+    ADVICE_KEYWORDS = ["should", "recommend", "suitable", "best university", "chances", "apply to"]
+
+    if any(re.search(rf"\b{kw}\b", user_question.lower()) for kw in ADVICE_KEYWORDS):
+        # Hard refusal
+        assistant_answer = (
+            "The dataset contains historical application outcomes of past students, "
+            "but it does not provide a basis for personalized university recommendations. "
+            "I can summarize where students with similar profiles applied or were admitted, "
+            "but I cannot suggest where you should apply."
+        )
+        return None, assistant_answer
+
     system_prompt = """
 You are Mentorly, a college counseling assistant.
 
@@ -310,7 +318,7 @@ Number of matching records:
     return [
         {"role": "system", "content": system_prompt.strip()},
         {"role": "user", "content": user_prompt.strip()}
-    ]
+    ], None
 
 # -------------------------------
 # POST /nl_query
@@ -318,6 +326,9 @@ Number of matching records:
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
 
+    # -------------------------------
+    # Phase 3.1 — LLM → filters
+    # -------------------------------
     prompt = f"""
 You are a strict JSON generator.
 
@@ -372,8 +383,28 @@ User query:
     filters = repair_llm_filters(filters)
     filters = normalize_filters(filters)
 
+    # -------------------------------
+    # Phase 5.1 — Check numeric constraints for zero-result queries
+    # -------------------------------
     records = sheet.get_all_records()
     students = filter_students(records, filters)
+
+    # Check if numeric constraints exist in query but missing from filters
+    numeric_keywords = ["ib", "SAT", "ACT"]
+    query_lower = req.message.lower()
+    for nk in numeric_keywords:
+        if nk in query_lower:
+            key_name = None
+            if nk == "ib":
+                key_name = "ib_min_12"
+            elif nk == "SAT":
+                key_name = "SAT Total score_min"
+            elif nk == "ACT":
+                key_name = "ACT Score_min"
+            if key_name and key_name not in filters:
+                # Force zero-result
+                students = []
+                break
 
     # -------------------------------
     # Phase 5.2 — RAG Answer Synthesis
@@ -381,13 +412,16 @@ User query:
     if len(students) == 0:
         assistant_answer = "No matching student records were found for your query."
     else:
-        rag_messages = build_rag_messages(req.message, students)
-        rag_response = client_llm.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=rag_messages,
-            temperature=0
-        )
-        assistant_answer = rag_response.choices[0].message.content.strip()
+        rag_messages, advice_refusal = build_rag_messages(req.message, students)
+        if advice_refusal:
+            assistant_answer = advice_refusal
+        else:
+            rag_response = client_llm.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=rag_messages,
+                temperature=0
+            )
+            assistant_answer = rag_response.choices[0].message.content.strip()
 
     return {
         "interpreted_filters": filters,
