@@ -7,8 +7,7 @@ from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
 import os
 import json
-import re
-from collections import Counter, defaultdict
+from collections import Counter
 
 app = FastAPI()
 
@@ -44,10 +43,10 @@ creds = Credentials.from_service_account_info(
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
 
-client_llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
 if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("OPENAI_API_KEY not set")
+
+client_llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # -------------------------------
 # Models
@@ -205,7 +204,7 @@ def normalize_filters(filters: dict) -> dict:
     return normalized
 
 # -------------------------------
-# Phase 3.4.3 — Repair LLM mistakes
+# Phase 3.4.3 — Repair LLM mistakes (FIXED)
 # -------------------------------
 def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
@@ -219,8 +218,19 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
             repaired["countries applied to"] = val
 
     query_lower = user_query.lower()
-    if "ib" in query_lower and "ib_min_12" not in repaired:
-        repaired["ib_min_12"] = 1
+
+    # ✅ Correct IB diploma defaults
+    if "ib" in query_lower:
+        if "ib_min_12" not in repaired:
+            repaired["ib_min_12"] = 24
+        if "ib_max_12" not in repaired:
+            repaired["ib_max_12"] = 45
+
+    # ✅ Guard against IB subject-grade hallucinations (1–7)
+    if repaired.get("ib_max_12") is not None and repaired["ib_max_12"] <= 7:
+        repaired["ib_max_12"] = 45
+    if repaired.get("ib_min_12") is not None and repaired["ib_min_12"] < 24:
+        repaired["ib_min_12"] = 24
 
     return repaired
 
@@ -244,8 +254,8 @@ def compute_analytics(students: list) -> dict:
     )
 
     analytics["admitted_universities"] = Counter(
-        s.get("Admitted University", "").strip().lower()
-        for s in students if s.get("Admitted University")
+        s.get("Accepted Univ", "").strip().lower()
+        for s in students if s.get("Accepted Univ")
     )
 
     ib_scores = [
@@ -295,6 +305,7 @@ User query:
 
     raw = response.choices[0].message.content
     filters = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+
     filters = repair_llm_filters(filters, req.message)
     filters = normalize_filters(filters)
 
