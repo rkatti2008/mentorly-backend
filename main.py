@@ -96,8 +96,12 @@ def get_column_value(row: dict, key: str):
 def filter_students(records, query_params):
     filtered = []
 
-    sat_used = any(k.startswith("SAT") for k in query_params)
-    act_used = any(k.startswith("ACT") for k in query_params)
+    # --- FIX: Only consider SAT/ACT filters if actual numeric values are present ---
+    sat_vals = [query_params.get("SAT Total score_min"), query_params.get("SAT Total score_max")]
+    act_vals = [query_params.get("ACT Score_min"), query_params.get("ACT Score_max")]
+
+    sat_used = any(v is not None for v in sat_vals)
+    act_used = any(v is not None for v in act_vals)
 
     if sat_used and act_used:
         raise HTTPException(
