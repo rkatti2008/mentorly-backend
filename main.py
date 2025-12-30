@@ -305,6 +305,39 @@ def compute_analytics(students: list) -> dict:
     return analytics
 
 # -------------------------------
+# Phase 5.4 — Generate Insights from Analytics
+# -------------------------------
+def generate_insights(analytics: dict) -> dict:
+    if not analytics:
+        return {}
+
+    insights = {}
+
+    countries_counter = analytics.get("countries_applied", Counter())
+    if countries_counter:
+        top_countries = countries_counter.most_common(3)
+        insights["top_countries_applied_to"] = [
+            {"country": country, "count": count} for country, count in top_countries
+        ]
+
+    majors_counter = analytics.get("intended_majors", Counter())
+    if majors_counter:
+        top_majors = majors_counter.most_common(3)
+        insights["top_intended_majors"] = [
+            {"major": major, "count": count} for major, count in top_majors
+        ]
+
+    ib_range = analytics.get("ib_score_range")
+    if ib_range:
+        insights["ib_score_summary"] = {
+            "min": ib_range.get("min"),
+            "max": ib_range.get("max"),
+            "average": ib_range.get("average")
+        }
+
+    return insights
+
+# -------------------------------
 # POST /nl_query
 # -------------------------------
 @app.post("/nl_query")
@@ -343,6 +376,7 @@ User query:
     students = filter_students(records, filters)
 
     analytics = compute_analytics(students)
+    insights = generate_insights(analytics)
 
     if not students:
         assistant_answer = "No matching student records were found for your query."
@@ -354,5 +388,6 @@ User query:
         "count": len(students),
         "assistant_answer": assistant_answer,
         "analytics": analytics,
+        "insights": insights,
         "students": students
     }
