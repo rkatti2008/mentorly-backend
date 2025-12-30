@@ -228,7 +228,7 @@ def normalize_filters(filters: dict) -> dict:
     return normalized
 
 # -------------------------------
-# Phase 3.4.3 — Repair LLM mistakes (FIXED)
+# Phase 3.4.3 — Repair LLM mistakes
 # -------------------------------
 def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
@@ -238,11 +238,9 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
         if val is not None:
-            # Normalize to list
             if isinstance(val, str):
                 val = [val]
-            # Remove if it looks like a country
-            val_lower = [v.lower() for v in val if v is not None]
+            val_lower = [v.lower() for v in val if v]
             if any(v in COUNTRY_WORDS for v in val_lower):
                 repaired.pop("admitted univs")
                 repaired["countries applied to"] = val_lower[0]
@@ -250,22 +248,14 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
                 repaired["admitted univs"] = val
 
     query_lower = user_query.lower()
-
     if "ib" in query_lower:
-        if "ib_min_12" not in repaired:
-            repaired["ib_min_12"] = 24
-        if "ib_max_12" not in repaired:
-            repaired["ib_max_12"] = 45
-
-    if repaired.get("ib_max_12") is not None and repaired["ib_max_12"] <= 7:
-        repaired["ib_max_12"] = 45
-    if repaired.get("ib_min_12") is not None and repaired["ib_min_12"] < 24:
-        repaired["ib_min_12"] = 24
+        repaired.setdefault("ib_min_12", 24)
+        repaired.setdefault("ib_max_12", 45)
 
     return repaired
 
 # -------------------------------
-# Phase 5.3.2 — Analytics Helpers
+# Phase 5.3 — Analytics
 # -------------------------------
 def compute_analytics(students: list) -> dict:
     if not students:
@@ -305,37 +295,46 @@ def compute_analytics(students: list) -> dict:
     return analytics
 
 # -------------------------------
-# Phase 5.4 — Generate Insights from Analytics
+# Phase 5.5 — LLM Summary
 # -------------------------------
-def generate_insights(analytics: dict) -> dict:
-    if not analytics:
-        return {}
+def generate_llm_summary(students, filters, insights):
+    sample = students[:5]
 
-    insights = {}
-
-    countries_counter = analytics.get("countries_applied", Counter())
-    if countries_counter:
-        top_countries = countries_counter.most_common(3)
-        insights["top_countries_applied_to"] = [
-            {"country": country, "count": count} for country, count in top_countries
-        ]
-
-    majors_counter = analytics.get("intended_majors", Counter())
-    if majors_counter:
-        top_majors = majors_counter.most_common(3)
-        insights["top_intended_majors"] = [
-            {"major": major, "count": count} for major, count in top_majors
-        ]
-
-    ib_range = analytics.get("ib_score_range")
-    if ib_range:
-        insights["ib_score_summary"] = {
-            "min": ib_range.get("min"),
-            "max": ib_range.get("max"),
-            "average": ib_range.get("average")
+    compact_students = [
+        {
+            "ib_score": s.get("12th grade overall score"),
+            "major": s.get("Intended Major"),
+            "accepted_univ": s.get("Accepted Univ"),
+            "countries": s.get("Countries Applied To")
         }
+        for s in sample
+    ]
 
-    return insights
+    prompt = f"""
+You are a college admissions counselor.
+Summarize patterns based ONLY on the data below.
+Do not invent facts.
+
+Filters used:
+{json.dumps(filters, indent=2)}
+
+Insights:
+{json.dumps(insights, indent=2)}
+
+Student samples:
+{json.dumps(compact_students, indent=2)}
+
+Write 3–5 sentences giving helpful, neutral insights.
+"""
+
+    response = client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=180
+    )
+
+    return response.choices[0].message.content.strip()
 
 # -------------------------------
 # POST /nl_query
@@ -376,18 +375,17 @@ User query:
     students = filter_students(records, filters)
 
     analytics = compute_analytics(students)
-    insights = generate_insights(analytics)
+    insights = analytics  # reuse analytics directly
 
     if not students:
         assistant_answer = "No matching student records were found for your query."
     else:
-        assistant_answer = f"{len(students)} matching student records were found."
+        assistant_answer = generate_llm_summary(students, filters, insights)
 
     return {
         "interpreted_filters": filters,
         "count": len(students),
         "assistant_answer": assistant_answer,
         "analytics": analytics,
-        "insights": insights,
         "students": students
     }
