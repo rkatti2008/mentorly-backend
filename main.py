@@ -337,6 +337,39 @@ Write 3–5 sentences giving helpful, neutral insights.
     return response.choices[0].message.content.strip()
 
 # -------------------------------
+# Phase 5.7 — Counselor Explanation
+# -------------------------------
+def generate_counselor_explanation(filters, students, analytics):
+    prompt = f"""
+You are an experienced college counselor.
+
+Explain the results clearly.
+If results are zero, explain likely semantic reasons and suggest how to broaden the query.
+Engineering includes Mechanical, Electrical, Civil, etc.
+Do NOT invent student data.
+
+Filters used:
+{json.dumps(filters, indent=2)}
+
+Result count:
+{len(students)}
+
+Analytics:
+{json.dumps(analytics, indent=2)}
+
+Write 3–5 sentences.
+"""
+
+    response = client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=200
+    )
+
+    return response.choices[0].message.content.strip()
+
+# -------------------------------
 # POST /nl_query
 # -------------------------------
 @app.post("/nl_query")
@@ -375,12 +408,17 @@ User query:
     students = filter_students(records, filters)
 
     analytics = compute_analytics(students)
-    insights = analytics  # reuse analytics directly
 
-    if not students:
-        assistant_answer = "No matching student records were found for your query."
-    else:
-        assistant_answer = generate_llm_summary(students, filters, insights)
+    assistant_answer = generate_counselor_explanation(
+        filters=filters,
+        students=students,
+        analytics=analytics
+    )
+
+    if students:
+        assistant_answer += "\n\n" + generate_llm_summary(
+            students, filters, analytics
+        )
 
     return {
         "interpreted_filters": filters,
