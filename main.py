@@ -96,7 +96,6 @@ def get_column_value(row: dict, key: str):
 def filter_students(records, query_params):
     filtered = []
 
-    # Only consider SAT/ACT filters if actual numeric values are present
     sat_vals = [query_params.get("SAT Total score_min"), query_params.get("SAT Total score_max")]
     act_vals = [query_params.get("ACT Score_min"), query_params.get("ACT Score_max")]
 
@@ -154,7 +153,6 @@ def filter_students(records, query_params):
             if val is None:
                 continue
 
-            # Intended major
             if key.lower() == "intended_major":
                 majors = [m.strip() for m in val.split(",")]
                 cell = get_column_value(r, "Intended Major")
@@ -162,13 +160,11 @@ def filter_students(records, query_params):
                     include = False
                     break
 
-            # City
             elif key.lower() == "city":
                 if r.get("City of Graduation", "").lower() != val.lower():
                     include = False
                     break
 
-            # Admitted universities (list)
             elif key.lower() == "admitted univs":
                 cell = r.get("Accepted Univ", "")
                 if isinstance(val, list):
@@ -180,7 +176,6 @@ def filter_students(records, query_params):
                         include = False
                         break
 
-            # Countries applied to
             elif key.lower() == "countries applied to":
                 cell = r.get("Countries Applied To", "")
                 if not fuzzy_match(cell, val):
@@ -242,27 +237,26 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
 
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
-        # Normalize to list
-        if isinstance(val, str):
-            val = [val]
-        # Remove if it looks like a country
-        val_lower = [v.lower() for v in val]
-        if any(v in COUNTRY_WORDS for v in val_lower):
-            repaired.pop("admitted univs")
-            repaired["countries applied to"] = val_lower[0]
-        else:
-            repaired["admitted univs"] = val
+        if val is not None:
+            # Normalize to list
+            if isinstance(val, str):
+                val = [val]
+            # Remove if it looks like a country
+            val_lower = [v.lower() for v in val if v is not None]
+            if any(v in COUNTRY_WORDS for v in val_lower):
+                repaired.pop("admitted univs")
+                repaired["countries applied to"] = val_lower[0]
+            else:
+                repaired["admitted univs"] = val
 
     query_lower = user_query.lower()
 
-    # Correct IB diploma defaults
     if "ib" in query_lower:
         if "ib_min_12" not in repaired:
             repaired["ib_min_12"] = 24
         if "ib_max_12" not in repaired:
             repaired["ib_max_12"] = 45
 
-    # Guard against IB subject-grade hallucinations (1–7)
     if repaired.get("ib_max_12") is not None and repaired["ib_max_12"] <= 7:
         repaired["ib_max_12"] = 45
     if repaired.get("ib_min_12") is not None and repaired["ib_min_12"] < 24:
