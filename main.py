@@ -1,5 +1,5 @@
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
 import gspread
@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 import os
 import json
 import re
+from collections import Counter, defaultdict
 
 app = FastAPI()
 
@@ -47,34 +48,6 @@ client_llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("OPENAI_API_KEY not set")
-
-# -------------------------------
-# Phase 3.1 — Canonical maps
-# -------------------------------
-COUNTRY_CANONICAL = {
-    "america": "usa",
-    "united states": "usa",
-    "united states of america": "usa",
-    "us": "usa",
-    "amrika": "usa",
-    "u.s.": "usa",
-    "uk": "united kingdom",
-    "u.k.": "united kingdom",
-    "england": "united kingdom",
-}
-
-MAJOR_CANONICAL = {
-    "cs": "computer science",
-    "comp sci": "computer science",
-    "computer sciences": "computer science",
-    "ai": "artificial intelligence",
-    "artificial intel": "artificial intelligence",
-}
-
-UNIV_CANONICAL = {
-    "gatech": "georgia tech",
-    "georgia institute of technology": "georgia tech",
-}
 
 # -------------------------------
 # Models
@@ -142,12 +115,6 @@ def filter_students(records, query_params):
 
             min_ib = query_params.get("ib_min_12")
             max_ib = query_params.get("ib_max_12")
-
-            try:
-                min_ib = int(min_ib) if min_ib is not None else None
-                max_ib = int(max_ib) if max_ib is not None else None
-            except ValueError:
-                continue
 
             if not passes_numeric_filter(
                 r.get("12th grade overall score"),
@@ -227,13 +194,10 @@ def normalize_filters(filters: dict) -> dict:
     for key, val in filters.items():
         if isinstance(val, str):
             v = val.strip().lower()
-
             if key == "countries applied to":
                 v = COUNTRY_SYNONYMS.get(v, v)
-
             if key == "intended_major":
                 v = MAJOR_SYNONYMS.get(v, v)
-
             normalized[key] = v
         else:
             normalized[key] = val
@@ -241,93 +205,64 @@ def normalize_filters(filters: dict) -> dict:
     return normalized
 
 # -------------------------------
-# Phase 3.4.3 — Repair LLM mistakes (Updated for numeric parsing)
+# Phase 3.4.3 — Repair LLM mistakes
 # -------------------------------
 def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
 
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
 
-    # Fix country mistakenly placed under admitted univs
     if "admitted univs" in repaired:
         val = str(repaired["admitted univs"]).lower().strip()
         if val in COUNTRY_WORDS:
             repaired.pop("admitted univs")
             repaired["countries applied to"] = val
 
-    # Handle IB numeric bounds
     query_lower = user_query.lower()
-    ib_matches = re.findall(r'ib\s*(?:score|score\s*of)?\s*(<=?|>=?)?\s*(\d+)', query_lower)
-    for op, val in ib_matches:
-        val_int = int(val)
-        if op == "<=" or "max" in query_lower:
-            repaired["ib_max_12"] = val_int
-        elif op == ">=" or "min" in query_lower:
-            repaired["ib_min_12"] = val_int
-        else:
-            if "ib_min_12" not in repaired:
-                repaired["ib_min_12"] = 1
+    if "ib" in query_lower and "ib_min_12" not in repaired:
+        repaired["ib_min_12"] = 1
 
     return repaired
 
 # -------------------------------
-# Phase 5.1 — RAG Prompt Builder
+# Phase 5.3.2 — Analytics Helpers
 # -------------------------------
-def build_rag_messages(user_question: str, rows: list):
-    ADVICE_KEYWORDS = ["should", "recommend", "suitable", "best university", "chances", "apply to"]
+def compute_analytics(students: list) -> dict:
+    if not students:
+        return {}
 
-    if any(re.search(rf"\b{kw}\b", user_question.lower()) for kw in ADVICE_KEYWORDS):
-        assistant_answer = (
-            "The dataset contains historical application outcomes of past students, "
-            "but it does not provide a basis for personalized university recommendations. "
-            "I can summarize where students with similar profiles applied or were admitted, "
-            "but I cannot suggest where you should apply."
-        )
-        return None, assistant_answer
+    analytics = {}
 
-    system_prompt = """
-You are Mentorly, a college counseling assistant.
+    analytics["countries_applied"] = Counter(
+        s.get("Countries Applied To", "").strip().lower()
+        for s in students if s.get("Countries Applied To")
+    )
 
-You are given:
-1) A user question
-2) A set of student records retrieved from a database
+    analytics["intended_majors"] = Counter(
+        s.get("Intended Major", "").strip().lower()
+        for s in students if s.get("Intended Major")
+    )
 
-CRITICAL RULES:
-- You MUST use ONLY the provided student records.
-- You MUST NOT use any external knowledge, assumptions, or general advice.
-- If the provided records do not contain enough information to answer the question, say:
-  "Based on the available data, there is not enough information to answer this question."
+    analytics["admitted_universities"] = Counter(
+        s.get("Admitted University", "").strip().lower()
+        for s in students if s.get("Admitted University")
+    )
 
-ALLOWED:
-- Summarizing patterns visible in the records
-- Counting, grouping, and comparing the records
-- Rephrasing the data in clear natural language
+    ib_scores = [
+        int(s.get("12th grade overall score"))
+        for s in students
+        if s.get("12th Board", "").strip().upper() == "IBDP"
+        and str(s.get("12th grade overall score")).isdigit()
+    ]
 
-FORBIDDEN:
-- Predicting outcomes not shown in the data
-- Recommending universities or strategies not present in the records
-- Giving advice beyond what the data directly supports
+    if ib_scores:
+        analytics["ib_score_range"] = {
+            "min": min(ib_scores),
+            "max": max(ib_scores),
+            "average": round(sum(ib_scores) / len(ib_scores), 2)
+        }
 
-OUTPUT FORMAT:
-- A concise paragraph (3–6 sentences)
-- Reference only information visible in the records
-"""
-
-    user_prompt = f"""
-User question:
-{user_question}
-
-Retrieved student records:
-{json.dumps(rows, indent=2)}
-
-Number of matching records:
-{len(rows)}
-"""
-
-    return [
-        {"role": "system", "content": system_prompt.strip()},
-        {"role": "user", "content": user_prompt.strip()}
-    ], None
+    return analytics
 
 # -------------------------------
 # POST /nl_query
@@ -335,22 +270,11 @@ Number of matching records:
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
 
-    # Phase 3.1 — LLM → filters
     prompt = f"""
 You are a strict JSON generator.
+Convert the user query into JSON filters.
 
-Your task:
-Convert the user query into a JSON object of filters.
-
-CRITICAL RULES:
-- Output ONLY raw JSON
-- Do NOT include markdown
-- Do NOT include backticks
-- Do NOT include explanations
-- Do NOT include text before or after JSON
-- JSON must start with {{ and end with }}
-
-Allowed keys ONLY:
+Allowed keys:
 ib_min_12, ib_max_12,
 "SAT Total score_min", "SAT Total score_max",
 "ACT Score_min", "ACT Score_max",
@@ -358,16 +282,6 @@ intended_major,
 admitted univs,
 countries applied to,
 city
-
-Rules:
-- SAT and ACT must NEVER both appear
-- Use numbers for numeric values
-- Use strings for text values
-- Omit keys not mentioned in the query
-
-Rules for IB:
-- Phrases like "IB students" or "IBDP students" mean the student board is IB
-- If no IB score is mentioned, emit ib_min_12 = 1
 
 User query:
 "{req.message}"
@@ -379,55 +293,25 @@ User query:
         temperature=0
     )
 
-    raw_output = response.choices[0].message.content.strip()
-    start = raw_output.find("{")
-    end = raw_output.rfind("}")
-
-    if start == -1 or end == -1:
-        raise HTTPException(status_code=400, detail="LLM output did not contain JSON")
-
-    filters = json.loads(raw_output[start:end + 1])
+    raw = response.choices[0].message.content
+    filters = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
     filters = repair_llm_filters(filters, req.message)
     filters = normalize_filters(filters)
 
-    # Phase 5.1 — Check numeric constraints for zero-result queries
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
-    # Zero-result guard only applies if numeric keywords exist in query but missing from filters
-    numeric_keywords = ["ib", "SAT", "ACT"]
-    query_lower = req.message.lower()
-    for nk in numeric_keywords:
-        if nk in query_lower:
-            key_name = None
-            if nk == "ib":
-                key_name = "ib_min_12"
-            elif nk == "SAT":
-                key_name = "SAT Total score_min"
-            elif nk == "ACT":
-                key_name = "ACT Score_min"
-            if key_name and key_name not in filters:
-                students = []
-                break
+    analytics = compute_analytics(students)
 
-    # Phase 5.2 — RAG Answer Synthesis
-    if len(students) == 0:
+    if not students:
         assistant_answer = "No matching student records were found for your query."
     else:
-        rag_messages, advice_refusal = build_rag_messages(req.message, students)
-        if advice_refusal:
-            assistant_answer = advice_refusal
-        else:
-            rag_response = client_llm.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=rag_messages,
-                temperature=0
-            )
-            assistant_answer = rag_response.choices[0].message.content.strip()
+        assistant_answer = f"{len(students)} matching student records were found."
 
     return {
         "interpreted_filters": filters,
         "count": len(students),
         "assistant_answer": assistant_answer,
+        "analytics": analytics,
         "students": students
     }
