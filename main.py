@@ -241,21 +241,32 @@ def normalize_filters(filters: dict) -> dict:
     return normalized
 
 # -------------------------------
-# Phase 3.4.3 — Repair LLM mistakes
+# Phase 3.4.3 — Repair LLM mistakes (Updated for numeric parsing)
 # -------------------------------
-def repair_llm_filters(filters: dict) -> dict:
+def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
 
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
 
+    # Fix country mistakenly placed under admitted univs
     if "admitted univs" in repaired:
         val = str(repaired["admitted univs"]).lower().strip()
         if val in COUNTRY_WORDS:
             repaired.pop("admitted univs")
             repaired["countries applied to"] = val
 
-    if "ib_min_12" in repaired and "ib" not in repaired:
-        repaired.pop("ib_min_12")
+    # Handle IB numeric bounds
+    query_lower = user_query.lower()
+    ib_matches = re.findall(r'ib\s*(?:score|score\s*of)?\s*(<=?|>=?)?\s*(\d+)', query_lower)
+    for op, val in ib_matches:
+        val_int = int(val)
+        if op == "<=" or "max" in query_lower:
+            repaired["ib_max_12"] = val_int
+        elif op == ">=" or "min" in query_lower:
+            repaired["ib_min_12"] = val_int
+        else:
+            if "ib_min_12" not in repaired:
+                repaired["ib_min_12"] = 1
 
     return repaired
 
@@ -263,11 +274,9 @@ def repair_llm_filters(filters: dict) -> dict:
 # Phase 5.1 — RAG Prompt Builder
 # -------------------------------
 def build_rag_messages(user_question: str, rows: list):
-    # Advice firewall keywords
     ADVICE_KEYWORDS = ["should", "recommend", "suitable", "best university", "chances", "apply to"]
 
     if any(re.search(rf"\b{kw}\b", user_question.lower()) for kw in ADVICE_KEYWORDS):
-        # Hard refusal
         assistant_answer = (
             "The dataset contains historical application outcomes of past students, "
             "but it does not provide a basis for personalized university recommendations. "
@@ -326,9 +335,7 @@ Number of matching records:
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
 
-    # -------------------------------
     # Phase 3.1 — LLM → filters
-    # -------------------------------
     prompt = f"""
 You are a strict JSON generator.
 
@@ -380,16 +387,14 @@ User query:
         raise HTTPException(status_code=400, detail="LLM output did not contain JSON")
 
     filters = json.loads(raw_output[start:end + 1])
-    filters = repair_llm_filters(filters)
+    filters = repair_llm_filters(filters, req.message)
     filters = normalize_filters(filters)
 
-    # -------------------------------
     # Phase 5.1 — Check numeric constraints for zero-result queries
-    # -------------------------------
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
-    # Check if numeric constraints exist in query but missing from filters
+    # Zero-result guard only applies if numeric keywords exist in query but missing from filters
     numeric_keywords = ["ib", "SAT", "ACT"]
     query_lower = req.message.lower()
     for nk in numeric_keywords:
@@ -402,13 +407,10 @@ User query:
             elif nk == "ACT":
                 key_name = "ACT Score_min"
             if key_name and key_name not in filters:
-                # Force zero-result
                 students = []
                 break
 
-    # -------------------------------
     # Phase 5.2 — RAG Answer Synthesis
-    # -------------------------------
     if len(students) == 0:
         assistant_answer = "No matching student records were found for your query."
     else:
