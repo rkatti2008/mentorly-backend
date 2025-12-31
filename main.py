@@ -94,7 +94,7 @@ def get_column_value(row: dict, key: str):
     return None
 
 # -------------------------------
-# Core filter engine (LOCKED)
+# Core filter engine
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
@@ -119,12 +119,12 @@ def filter_students(records, query_params):
 
     for r in records:
 
-        # --- IB board-only filter (NEW & CRITICAL) ---
-        if query_params.get("ib_board_only"):
-            if r.get("12th Board", "").strip().upper() != "IBDP":
+        # --- Board-only filter (GENERALIZED) ---
+        if query_params.get("board_only"):
+            if r.get("12th Board", "").strip().upper() != query_params["board_only"]:
                 continue
 
-        # IB score filter (unchanged)
+        # --- IB score filter (IBDP only, unchanged logic) ---
         if query_params.get("ib_min_12") is not None or query_params.get("ib_max_12") is not None:
             if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
@@ -156,10 +156,9 @@ def filter_students(records, query_params):
 
         include = True
 
-        # Other filters
         for key, val in query_params.items():
             if key in [
-                "ib_board_only",
+                "board_only",
                 "ib_min_12", "ib_max_12",
                 "SAT Total score_min", "SAT Total score_max",
                 "ACT Score_min", "ACT Score_max"
@@ -210,7 +209,7 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Phase 3.4 — Filter normalization
+# Normalize filters
 # -------------------------------
 def normalize_filters(filters: dict) -> dict:
     normalized = {}
@@ -248,39 +247,51 @@ def normalize_filters(filters: dict) -> dict:
     return normalized
 
 # -------------------------------
-# Phase 3.4.3 — Repair LLM mistakes
+# Repair LLM mistakes
 # -------------------------------
 def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
 
+    BOARD_KEYWORDS = {
+        "ib": "IBDP",
+        "ibdp": "IBDP",
+        "cbse": "CBSE",
+        "icse": "ICSE"
+    }
+
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
 
-    # Prevent IB being treated as a university
-    if repaired.get("admitted univs") == "ib":
-        repaired.pop("admitted univs")
+    uq = user_query.lower()
 
+    # --- Board detection from user query ---
+    for word, board in BOARD_KEYWORDS.items():
+        if word in uq:
+            repaired["board_only"] = board
+            repaired.pop("admitted univs", None)
+
+            if board == "IBDP":
+                repaired.setdefault("ib_min_12", 24)
+                repaired.setdefault("ib_max_12", 45)
+            break
+
+    # --- Fix admitted univs mistakes ---
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
-        if val is not None:
+        if val:
             if isinstance(val, str):
                 val = [val]
             val_lower = [v.lower() for v in val if v]
+
             if any(v in COUNTRY_WORDS for v in val_lower):
                 repaired.pop("admitted univs")
                 repaired["countries applied to"] = val_lower[0]
             else:
                 repaired["admitted univs"] = val
 
-    # ✅ CRITICAL FIX: IB implies IBDP board
-    if "ib" in user_query.lower():
-        repaired["ib_board_only"] = True
-        repaired.setdefault("ib_min_12", 24)
-        repaired.setdefault("ib_max_12", 45)
-
     return repaired
 
 # -------------------------------
-# Phase 5.3 — Analytics
+# Analytics
 # -------------------------------
 def compute_analytics(students: list) -> dict:
     if not students:
@@ -320,7 +331,7 @@ def compute_analytics(students: list) -> dict:
     return analytics
 
 # -------------------------------
-# Phase 5.7 — Counselor Explanation
+# Counselor Explanation
 # -------------------------------
 def generate_counselor_explanation(filters, students, analytics):
     prompt = f"""
