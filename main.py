@@ -118,9 +118,13 @@ def filter_students(records, query_params):
         )
 
     for r in records:
-        include = True
 
-        # IB filter
+        # --- IB board-only filter (NEW & CRITICAL) ---
+        if query_params.get("ib_board_only"):
+            if r.get("12th Board", "").strip().upper() != "IBDP":
+                continue
+
+        # IB score filter (unchanged)
         if query_params.get("ib_min_12") is not None or query_params.get("ib_max_12") is not None:
             if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
@@ -150,9 +154,12 @@ def filter_students(records, query_params):
             ):
                 continue
 
+        include = True
+
         # Other filters
         for key, val in query_params.items():
             if key in [
+                "ib_board_only",
                 "ib_min_12", "ib_max_12",
                 "SAT Total score_min", "SAT Total score_max",
                 "ACT Score_min", "ACT Score_max"
@@ -249,10 +256,8 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
 
     # Prevent IB being treated as a university
-    if "admitted univs" in repaired:
-        val = repaired["admitted univs"]
-        if isinstance(val, str) and val.lower() == "ib":
-            repaired.pop("admitted univs")
+    if repaired.get("admitted univs") == "ib":
+        repaired.pop("admitted univs")
 
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
@@ -266,7 +271,9 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
             else:
                 repaired["admitted univs"] = val
 
+    # ✅ CRITICAL FIX: IB implies IBDP board
     if "ib" in user_query.lower():
+        repaired["ib_board_only"] = True
         repaired.setdefault("ib_min_12", 24)
         repaired.setdefault("ib_max_12", 45)
 
