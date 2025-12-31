@@ -11,6 +11,9 @@ from collections import Counter
 
 app = FastAPI()
 
+# -------------------------------
+# CORS
+# -------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -41,7 +44,7 @@ creds = Credentials.from_service_account_info(
 )
 
 client = gspread.authorize(creds)
-sheet = client.open_by_key(SHEET_ID).sheet1  
+sheet = client.open_by_key(SHEET_ID).sheet1
 
 if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("OPENAI_API_KEY not set")
@@ -96,8 +99,14 @@ def get_column_value(row: dict, key: str):
 def filter_students(records, query_params):
     filtered = []
 
-    sat_vals = [query_params.get("SAT Total score_min"), query_params.get("SAT Total score_max")]
-    act_vals = [query_params.get("ACT Score_min"), query_params.get("ACT Score_max")]
+    sat_vals = [
+        query_params.get("SAT Total score_min"),
+        query_params.get("SAT Total score_max"),
+    ]
+    act_vals = [
+        query_params.get("ACT Score_min"),
+        query_params.get("ACT Score_max"),
+    ]
 
     sat_used = any(v is not None for v in sat_vals)
     act_used = any(v is not None for v in act_vals)
@@ -201,7 +210,6 @@ def normalize_filters(filters: dict) -> dict:
 
     COUNTRY_SYNONYMS = {
         "america": "usa",
-        "amrika": "usa",
         "united states": "usa",
         "united states of america": "usa",
         "us": "usa",
@@ -209,6 +217,11 @@ def normalize_filters(filters: dict) -> dict:
     }
 
     MAJOR_SYNONYMS = {
+        "engineering": (
+            "mechanical engineering, electrical engineering, "
+            "civil engineering, chemical engineering, "
+            "computer engineering, aerospace engineering"
+        ),
         "cs": "computer science",
         "comp sci": "computer science",
         "cse": "computer science"
@@ -235,6 +248,12 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
 
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
 
+    # Prevent IB being treated as a university
+    if "admitted univs" in repaired:
+        val = repaired["admitted univs"]
+        if isinstance(val, str) and val.lower() == "ib":
+            repaired.pop("admitted univs")
+
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
         if val is not None:
@@ -247,8 +266,7 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
             else:
                 repaired["admitted univs"] = val
 
-    query_lower = user_query.lower()
-    if "ib" in query_lower:
+    if "ib" in user_query.lower():
         repaired.setdefault("ib_min_12", 24)
         repaired.setdefault("ib_max_12", 45)
 
@@ -295,48 +313,6 @@ def compute_analytics(students: list) -> dict:
     return analytics
 
 # -------------------------------
-# Phase 5.5 — LLM Summary
-# -------------------------------
-def generate_llm_summary(students, filters, insights):
-    sample = students[:5]
-
-    compact_students = [
-        {
-            "ib_score": s.get("12th grade overall score"),
-            "major": s.get("Intended Major"),
-            "accepted_univ": s.get("Accepted Univ"),
-            "countries": s.get("Countries Applied To")
-        }
-        for s in sample
-    ]
-
-    prompt = f"""
-You are a college admissions counselor.
-Summarize patterns based ONLY on the data below.
-Do not invent facts.
-
-Filters used:
-{json.dumps(filters, indent=2)}
-
-Insights:
-{json.dumps(insights, indent=2)}
-
-Student samples:
-{json.dumps(compact_students, indent=2)}
-
-Write 3–5 sentences giving helpful, neutral insights.
-"""
-
-    response = client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=180
-    )
-
-    return response.choices[0].message.content.strip()
-
-# -------------------------------
 # Phase 5.7 — Counselor Explanation
 # -------------------------------
 def generate_counselor_explanation(filters, students, analytics):
@@ -345,7 +321,7 @@ You are an experienced college counselor.
 
 Explain the results clearly.
 If results are zero, explain likely semantic reasons and suggest how to broaden the query.
-Engineering includes Mechanical, Electrical, Civil, etc.
+Engineering includes Mechanical, Electrical, Civil, Chemical, etc.
 Do NOT invent student data.
 
 Filters used:
@@ -414,11 +390,6 @@ User query:
         students=students,
         analytics=analytics
     )
-
-    if students:
-        assistant_answer += "\n\n" + generate_llm_summary(
-            students, filters, analytics
-        )
 
     return {
         "interpreted_filters": filters,
