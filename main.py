@@ -94,7 +94,7 @@ def get_column_value(row: dict, key: str):
     return None
 
 # -------------------------------
-# Core filter engine
+# Core filter engine (LOCKED)
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
@@ -119,12 +119,16 @@ def filter_students(records, query_params):
 
     for r in records:
 
-        # --- Board-only filter (GENERALIZED) ---
-        if query_params.get("board_only"):
-            if r.get("12th Board", "").strip().upper() != query_params["board_only"]:
+        # ---- Board-only filters ----
+        if query_params.get("ib_board_only"):
+            if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
 
-        # --- IB score filter (IBDP only, unchanged logic) ---
+        if query_params.get("cbse_board_only"):
+            if r.get("12th Board", "").strip().upper() != "CBSE":
+                continue
+
+        # IB score filter
         if query_params.get("ib_min_12") is not None or query_params.get("ib_max_12") is not None:
             if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
@@ -158,7 +162,7 @@ def filter_students(records, query_params):
 
         for key, val in query_params.items():
             if key in [
-                "board_only",
+                "ib_board_only", "cbse_board_only",
                 "ib_min_12", "ib_max_12",
                 "SAT Total score_min", "SAT Total score_max",
                 "ACT Score_min", "ACT Score_max"
@@ -227,10 +231,7 @@ def normalize_filters(filters: dict) -> dict:
             "mechanical engineering, electrical engineering, "
             "civil engineering, chemical engineering, "
             "computer engineering, aerospace engineering"
-        ),
-        "cs": "computer science",
-        "comp sci": "computer science",
-        "cse": "computer science"
+        )
     }
 
     for key, val in filters.items():
@@ -252,41 +253,42 @@ def normalize_filters(filters: dict) -> dict:
 def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
 
-    BOARD_KEYWORDS = {
-        "ib": "IBDP",
-        "ibdp": "IBDP",
-        "cbse": "CBSE",
-        "icse": "ICSE"
-    }
-
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
+    BOARD_WORDS = {"ib", "ibdp", "cbse", "icse", "isc", "state board"}
 
-    uq = user_query.lower()
-
-    # --- Board detection from user query ---
-    for word, board in BOARD_KEYWORDS.items():
-        if word in uq:
-            repaired["board_only"] = board
-            repaired.pop("admitted univs", None)
-
-            if board == "IBDP":
-                repaired.setdefault("ib_min_12", 24)
-                repaired.setdefault("ib_max_12", 45)
-            break
-
-    # --- Fix admitted univs mistakes ---
+    # Remove boards from admitted universities
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
-        if val:
-            if isinstance(val, str):
-                val = [val]
-            val_lower = [v.lower() for v in val if v]
-
-            if any(v in COUNTRY_WORDS for v in val_lower):
+        if isinstance(val, str):
+            val_lower = val.lower()
+            if val_lower in BOARD_WORDS:
                 repaired.pop("admitted univs")
-                repaired["countries applied to"] = val_lower[0]
+        elif isinstance(val, list):
+            cleaned = [v for v in val if v.lower() not in BOARD_WORDS]
+            if cleaned:
+                repaired["admitted univs"] = cleaned
             else:
-                repaired["admitted univs"] = val
+                repaired.pop("admitted univs")
+
+    # Country misclassification
+    if "admitted univs" in repaired:
+        val = repaired["admitted univs"]
+        if isinstance(val, str):
+            val = [val]
+        val_lower = [v.lower() for v in val if v]
+        if any(v in COUNTRY_WORDS for v in val_lower):
+            repaired.pop("admitted univs")
+            repaired["countries applied to"] = val_lower[0]
+
+    # Board inference
+    q = user_query.lower()
+    if "ib" in q:
+        repaired["ib_board_only"] = True
+        repaired.setdefault("ib_min_12", 24)
+        repaired.setdefault("ib_max_12", 45)
+
+    if "cbse" in q:
+        repaired["cbse_board_only"] = True
 
     return repaired
 
@@ -314,24 +316,10 @@ def compute_analytics(students: list) -> dict:
         for s in students if s.get("Accepted Univ")
     )
 
-    ib_scores = [
-        int(s.get("12th grade overall score"))
-        for s in students
-        if s.get("12th Board", "").strip().upper() == "IBDP"
-        and str(s.get("12th grade overall score")).isdigit()
-    ]
-
-    if ib_scores:
-        analytics["ib_score_range"] = {
-            "min": min(ib_scores),
-            "max": max(ib_scores),
-            "average": round(sum(ib_scores) / len(ib_scores), 2)
-        }
-
     return analytics
 
 # -------------------------------
-# Counselor Explanation
+# Counselor explanation
 # -------------------------------
 def generate_counselor_explanation(filters, students, analytics):
     prompt = f"""
@@ -342,16 +330,12 @@ If results are zero, explain likely semantic reasons and suggest how to broaden 
 Engineering includes Mechanical, Electrical, Civil, Chemical, etc.
 Do NOT invent student data.
 
-Filters used:
+Filters:
 {json.dumps(filters, indent=2)}
 
-Result count:
-{len(students)}
-
+Count: {len(students)}
 Analytics:
 {json.dumps(analytics, indent=2)}
-
-Write 3–5 sentences.
 """
 
     response = client_llm.chat.completions.create(
@@ -364,13 +348,11 @@ Write 3–5 sentences.
     return response.choices[0].message.content.strip()
 
 # -------------------------------
-# POST /nl_query
+# API
 # -------------------------------
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
-
     prompt = f"""
-You are a strict JSON generator.
 Convert the user query into JSON filters.
 
 Allowed keys:
@@ -403,16 +385,12 @@ User query:
 
     analytics = compute_analytics(students)
 
-    assistant_answer = generate_counselor_explanation(
-        filters=filters,
-        students=students,
-        analytics=analytics
-    )
+    answer = generate_counselor_explanation(filters, students, analytics)
 
     return {
         "interpreted_filters": filters,
         "count": len(students),
-        "assistant_answer": assistant_answer,
+        "assistant_answer": answer,
         "analytics": analytics,
         "students": students
     }
