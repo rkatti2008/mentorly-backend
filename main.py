@@ -248,7 +248,7 @@ def normalize_filters(filters: dict) -> dict:
     return normalized
 
 # -------------------------------
-# Repair LLM mistakes
+# Repair LLM mistakes (FIXED)
 # -------------------------------
 def repair_llm_filters(filters: dict, user_query: str) -> dict:
     repaired = dict(filters)
@@ -256,13 +256,16 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
     COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
     BOARD_WORDS = {"ib", "ibdp", "cbse", "icse", "isc", "state board"}
 
+    q = user_query.lower()
+
     # Remove boards from admitted universities
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
+
         if isinstance(val, str):
-            val_lower = val.lower()
-            if val_lower in BOARD_WORDS:
+            if val.lower() in BOARD_WORDS:
                 repaired.pop("admitted univs")
+
         elif isinstance(val, list):
             cleaned = [v for v in val if v.lower() not in BOARD_WORDS]
             if cleaned:
@@ -270,25 +273,41 @@ def repair_llm_filters(filters: dict, user_query: str) -> dict:
             else:
                 repaired.pop("admitted univs")
 
-    # Country misclassification
+    # Country misclassification inside admitted univs
     if "admitted univs" in repaired:
         val = repaired["admitted univs"]
-        if isinstance(val, str):
-            val = [val]
-        val_lower = [v.lower() for v in val if v]
-        if any(v in COUNTRY_WORDS for v in val_lower):
-            repaired.pop("admitted univs")
-            repaired["countries applied to"] = val_lower[0]
+        vals = [val] if isinstance(val, str) else val
+        vals_lower = [v.lower() for v in vals if v]
+
+        for v in vals_lower:
+            if v in COUNTRY_WORDS:
+                repaired.pop("admitted univs")
+                repaired["countries applied to"] = v
+                break
 
     # Board inference
-    q = user_query.lower()
     if "ib" in q:
         repaired["ib_board_only"] = True
         repaired.setdefault("ib_min_12", 24)
         repaired.setdefault("ib_max_12", 45)
 
+        if repaired.get("countries applied to") in BOARD_WORDS:
+            repaired.pop("countries applied to")
+
     if "cbse" in q:
         repaired["cbse_board_only"] = True
+
+        if repaired.get("countries applied to") in BOARD_WORDS:
+            repaired.pop("countries applied to")
+
+    # Board-only query → remove country filter
+    board_only = (
+        ("cbse" in q or "ib" in q)
+        and not any(c in q for c in COUNTRY_WORDS)
+    )
+
+    if board_only:
+        repaired.pop("countries applied to", None)
 
     return repaired
 
