@@ -58,6 +58,66 @@ class ChatRequest(BaseModel):
     message: str
 
 # -------------------------------
+# Phase 6.1 — Intent Classification
+# -------------------------------
+def classify_intent(user_query: str) -> str:
+    q = user_query.lower()
+
+    advisory_keywords = [
+        "can you advise",
+        "what should i do",
+        "guidance",
+        "counsel",
+        "advice",
+        "i am a student",
+        "i want to apply",
+        "help me choose",
+        "what are my chances"
+    ]
+
+    if any(k in q for k in advisory_keywords):
+        return "advisory"
+
+    return "analytics"
+
+# -------------------------------
+# Phase 6.1 — Counselor-only advice
+# -------------------------------
+def handle_advisory(user_query: str) -> dict:
+    prompt = f"""
+You are an experienced international college counselor.
+
+The student is asking for personal guidance.
+Do NOT mention databases, analytics, counts, or other students.
+Do NOT fabricate statistics.
+Respond like a real counselor:
+- Calm
+- Structured
+- Encouraging
+- Action-oriented
+
+Student query:
+"{user_query}"
+
+Provide:
+1. Short reassurance
+2. Key considerations
+3. Next concrete steps
+"""
+
+    response = client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.5,
+        max_tokens=400
+    )
+
+    return {
+        "intent": "advisory",
+        "assistant_answer": response.choices[0].message.content.strip()
+    }
+
+# -------------------------------
 # Helpers
 # -------------------------------
 def passes_numeric_filter(value_raw, min_val=None, max_val=None):
@@ -119,7 +179,6 @@ def filter_students(records, query_params):
 
     for r in records:
 
-        # ---- Board-only filters ----
         if query_params.get("ib_board_only"):
             if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
@@ -128,7 +187,6 @@ def filter_students(records, query_params):
             if r.get("12th Board", "").strip().upper() != "CBSE":
                 continue
 
-        # IB score filter
         if query_params.get("ib_min_12") is not None or query_params.get("ib_max_12") is not None:
             if r.get("12th Board", "").strip().upper() != "IBDP":
                 continue
@@ -140,7 +198,6 @@ def filter_students(records, query_params):
             ):
                 continue
 
-        # SAT filter
         if sat_used:
             if not passes_numeric_filter(
                 r.get("SAT Total score"),
@@ -149,7 +206,6 @@ def filter_students(records, query_params):
             ):
                 continue
 
-        # ACT filter
         if act_used:
             if not passes_numeric_filter(
                 r.get("ACT Score"),
@@ -213,164 +269,39 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Normalize filters
-# -------------------------------
-def normalize_filters(filters: dict) -> dict:
-    normalized = {}
-
-    COUNTRY_SYNONYMS = {
-        "america": "usa",
-        "united states": "usa",
-        "united states of america": "usa",
-        "us": "usa",
-        "u.s.": "usa"
-    }
-
-    MAJOR_SYNONYMS = {
-        "engineering": (
-            "mechanical engineering, electrical engineering, "
-            "civil engineering, chemical engineering, "
-            "computer engineering, aerospace engineering"
-        )
-    }
-
-    for key, val in filters.items():
-        if isinstance(val, str):
-            v = val.strip().lower()
-            if key == "countries applied to":
-                v = COUNTRY_SYNONYMS.get(v, v)
-            if key == "intended_major":
-                v = MAJOR_SYNONYMS.get(v, v)
-            normalized[key] = v
-        else:
-            normalized[key] = val
-
-    return normalized
-
-# -------------------------------
-# Repair LLM mistakes (FIXED)
-# -------------------------------
-def repair_llm_filters(filters: dict, user_query: str) -> dict:
-    repaired = dict(filters)
-
-    COUNTRY_WORDS = {"america", "usa", "us", "united states", "uk", "canada", "india"}
-    BOARD_WORDS = {"ib", "ibdp", "cbse", "icse", "isc", "state board"}
-
-    q = user_query.lower()
-
-    # Remove boards from admitted universities
-    if "admitted univs" in repaired:
-        val = repaired["admitted univs"]
-
-        if isinstance(val, str):
-            if val.lower() in BOARD_WORDS:
-                repaired.pop("admitted univs")
-
-        elif isinstance(val, list):
-            cleaned = [v for v in val if v.lower() not in BOARD_WORDS]
-            if cleaned:
-                repaired["admitted univs"] = cleaned
-            else:
-                repaired.pop("admitted univs")
-
-    # Country misclassification inside admitted univs
-    if "admitted univs" in repaired:
-        val = repaired["admitted univs"]
-        vals = [val] if isinstance(val, str) else val
-        vals_lower = [v.lower() for v in vals if v]
-
-        for v in vals_lower:
-            if v in COUNTRY_WORDS:
-                repaired.pop("admitted univs")
-                repaired["countries applied to"] = v
-                break
-
-    # Board inference
-    if "ib" in q:
-        repaired["ib_board_only"] = True
-        repaired.setdefault("ib_min_12", 24)
-        repaired.setdefault("ib_max_12", 45)
-
-        if repaired.get("countries applied to") in BOARD_WORDS:
-            repaired.pop("countries applied to")
-
-    if "cbse" in q:
-        repaired["cbse_board_only"] = True
-
-        if repaired.get("countries applied to") in BOARD_WORDS:
-            repaired.pop("countries applied to")
-
-    # Board-only query → remove country filter
-    board_only = (
-        ("cbse" in q or "ib" in q)
-        and not any(c in q for c in COUNTRY_WORDS)
-    )
-
-    if board_only:
-        repaired.pop("countries applied to", None)
-
-    return repaired
-
-# -------------------------------
 # Analytics
 # -------------------------------
 def compute_analytics(students: list) -> dict:
     if not students:
         return {}
 
-    analytics = {}
-
-    analytics["countries_applied"] = Counter(
-        s.get("Countries Applied To", "").strip().lower()
-        for s in students if s.get("Countries Applied To")
-    )
-
-    analytics["intended_majors"] = Counter(
-        s.get("Intended Major", "").strip().lower()
-        for s in students if s.get("Intended Major")
-    )
-
-    analytics["admitted_universities"] = Counter(
-        s.get("Accepted Univ", "").strip().lower()
-        for s in students if s.get("Accepted Univ")
-    )
-
-    return analytics
-
-# -------------------------------
-# Counselor explanation
-# -------------------------------
-def generate_counselor_explanation(filters, students, analytics):
-    prompt = f"""
-You are an experienced college counselor.
-
-Explain the results clearly.
-If results are zero, explain likely semantic reasons and suggest how to broaden the query.
-Engineering includes Mechanical, Electrical, Civil, Chemical, etc.
-Do NOT invent student data.
-
-Filters:
-{json.dumps(filters, indent=2)}
-
-Count: {len(students)}
-Analytics:
-{json.dumps(analytics, indent=2)}
-"""
-
-    response = client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=200
-    )
-
-    return response.choices[0].message.content.strip()
+    return {
+        "countries_applied": Counter(
+            s.get("Countries Applied To", "").strip().lower()
+            for s in students if s.get("Countries Applied To")
+        ),
+        "intended_majors": Counter(
+            s.get("Intended Major", "").strip().lower()
+            for s in students if s.get("Intended Major")
+        ),
+        "admitted_universities": Counter(
+            s.get("Accepted Univ", "").strip().lower()
+            for s in students if s.get("Accepted Univ")
+        ),
+    }
 
 # -------------------------------
 # API
 # -------------------------------
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
+
+    intent = classify_intent(req.message)
+
+    if intent == "advisory":
+        return handle_advisory(req.message)
+
+    # ---------- Phase 5 analytics pipeline ----------
     prompt = f"""
 Convert the user query into JSON filters.
 
@@ -396,20 +327,14 @@ User query:
     raw = response.choices[0].message.content
     filters = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
 
-    filters = repair_llm_filters(filters, req.message)
-    filters = normalize_filters(filters)
-
     records = sheet.get_all_records()
     students = filter_students(records, filters)
-
     analytics = compute_analytics(students)
 
-    answer = generate_counselor_explanation(filters, students, analytics)
-
     return {
+        "intent": "analytics",
         "interpreted_filters": filters,
         "count": len(students),
-        "assistant_answer": answer,
         "analytics": analytics,
         "students": students
     }
