@@ -153,7 +153,7 @@ def get_column_value(row: dict, key: str):
     return None
 
 # -------------------------------
-# Core filter engine (lightweight)
+# Core filter engine
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
@@ -184,7 +184,7 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Phase 6.2.3 — Board-aware analytics (NEW)
+# Phase 6.2.3 — Board-aware filtering
 # -------------------------------
 def apply_board_filter(students: list, user_query: str) -> list:
     q = user_query.lower()
@@ -219,6 +219,43 @@ def compute_analytics(students: list) -> dict:
             s.get("Intended Major", "").strip().lower()
             for s in students if s.get("Intended Major")
         ),
+    }
+
+# -------------------------------
+# Phase 6.2.3 — Analytics Narrator (NEW)
+# -------------------------------
+def handle_analytics_response(user_query: str, filters: dict, students: list) -> dict:
+    count = len(students)
+
+    prompt = f"""
+You are an international admissions data analyst.
+
+User question:
+"{user_query}"
+
+Applied filters:
+{json.dumps(filters, indent=2)}
+
+Result count:
+{count}
+
+Write a clear, direct answer:
+- Start with the numeric answer
+- Use one short explanatory sentence
+- No mention of databases or internal systems
+- Be neutral and factual
+"""
+
+    response = client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=120
+    )
+
+    return {
+        "intent": "analytics",
+        "assistant_answer": response.choices[0].message.content.strip()
     }
 
 # -------------------------------
@@ -277,7 +314,7 @@ async def nl_query(req: ChatRequest):
     if intent == "advisory":
         return handle_advisory(req.message)
 
-    # ---------- Phase 6 analytics filter extraction ----------
+    # ---------- Extract filters ----------
     prompt = f"""
 Convert the user query into JSON filters.
 
@@ -301,19 +338,14 @@ User query:
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
-    # ✅ Phase 6.2.3 applied here
+    # Board-aware filtering
     students = apply_board_filter(students, req.message)
 
     analytics = compute_analytics(students)
 
+    # ✅ Phase 6.2.3 — Proper analytics answer
     if intent == "analytics":
-        return {
-            "intent": "analytics",
-            "interpreted_filters": filters,
-            "count": len(students),
-            "analytics": analytics,
-            "students": students
-        }
+        return handle_analytics_response(req.message, filters, students)
 
     signals = summarize_signals(analytics)
     return handle_hybrid(req.message, signals)
