@@ -132,19 +132,6 @@ Provide:
 # -------------------------------
 # Helpers
 # -------------------------------
-def passes_numeric_filter(value_raw, min_val=None, max_val=None):
-    try:
-        value = int(value_raw)
-    except (TypeError, ValueError):
-        return False
-
-    if min_val is not None and value < min_val:
-        return False
-    if max_val is not None and value > max_val:
-        return False
-    return True
-
-
 def fuzzy_match(text, pattern, threshold=0.7):
     if not text or not pattern:
         return False
@@ -166,31 +153,12 @@ def get_column_value(row: dict, key: str):
     return None
 
 # -------------------------------
-# Core filter engine (LOCKED)
+# Core filter engine
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
 
-    sat_vals = [
-        query_params.get("SAT Total score_min"),
-        query_params.get("SAT Total score_max"),
-    ]
-    act_vals = [
-        query_params.get("ACT Score_min"),
-        query_params.get("ACT Score_max"),
-    ]
-
-    sat_used = any(v is not None for v in sat_vals)
-    act_used = any(v is not None for v in act_vals)
-
-    if sat_used and act_used:
-        raise HTTPException(
-            status_code=400,
-            detail="Please filter using either SAT or ACT, not both."
-        )
-
     for r in records:
-
         include = True
 
         for key, val in query_params.items():
@@ -216,7 +184,7 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Analytics 
+# Analytics
 # -------------------------------
 def compute_analytics(students: list) -> dict:
     if not students:
@@ -234,7 +202,34 @@ def compute_analytics(students: list) -> dict:
     }
 
 # -------------------------------
-# Phase 6.2.1 — Pattern → Advice Bridge
+# Phase 6.2.2 — Analytics Narration
+# -------------------------------
+def generate_analytics_answer(user_query: str, count: int, filters: dict) -> str:
+    q = user_query.lower()
+
+    if count == 0:
+        return (
+            "I couldn’t find any students matching this exact combination. "
+            "You may want to broaden the criteria slightly (for example, remove one filter) "
+            "to see broader patterns."
+        )
+
+    parts = []
+
+    if "ib" in q:
+        parts.append("IB students")
+    else:
+        parts.append("students")
+
+    if "usa" in q or "united states" in q:
+        parts.append("who applied to the USA")
+
+    sentence = " ".join(parts)
+
+    return f"Here’s what I found: **{count} {sentence}**."
+
+# -------------------------------
+# Phase 6.2.1 — Hybrid Signals
 # -------------------------------
 def summarize_signals(analytics: dict) -> dict:
     if not analytics:
@@ -289,7 +284,7 @@ async def nl_query(req: ChatRequest):
     if intent == "advisory":
         return handle_advisory(req.message)
 
-    # ---------- Phase 5 filter extraction ----------
+    # ---------- Filter extraction ----------
     prompt = f"""
 Convert the user query into JSON filters.
 
@@ -317,10 +312,12 @@ User query:
     if intent == "analytics":
         return {
             "intent": "analytics",
+            "assistant_answer": generate_analytics_answer(
+                req.message, len(students), filters
+            ),
             "interpreted_filters": filters,
             "count": len(students),
-            "analytics": analytics,
-            "students": students
+            "analytics": analytics
         }
 
     signals = summarize_signals(analytics)
