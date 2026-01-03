@@ -216,7 +216,7 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Analytics
+# Analytics 
 # -------------------------------
 def compute_analytics(students: list) -> dict:
     if not students:
