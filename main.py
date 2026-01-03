@@ -179,7 +179,14 @@ def filter_students(records, query_params):
                     for c in cell.split(",")
                     if c.strip()
                 ]
-                if val.lower() not in countries:
+
+                # ✅ FIX: normalize val (string OR list)
+                if isinstance(val, list):
+                    vals = [v.lower() for v in val]
+                else:
+                    vals = [val.lower()]
+
+                if not any(v in countries for v in vals):
                     include = False
                     break
 
@@ -189,7 +196,7 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Phase 6.2.3 — Board-aware filtering (FIXED)
+# Phase 6.2.3 — Board-aware filtering
 # -------------------------------
 def apply_board_filter(students: list, user_query: str) -> list:
     q = user_query.lower()
@@ -304,7 +311,7 @@ Respond with:
     }
 
 # -------------------------------
-# API  
+# API
 # -------------------------------
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
