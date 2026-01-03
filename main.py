@@ -153,7 +153,7 @@ def get_column_value(row: dict, key: str):
     return None
 
 # -------------------------------
-# Core filter engine
+# Core filter engine (FIXED)
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
@@ -174,7 +174,12 @@ def filter_students(records, query_params):
 
             elif key.lower() == "countries applied to":
                 cell = r.get("Countries Applied To", "")
-                if not fuzzy_match(cell, val):
+                countries = [
+                    c.strip().lower()
+                    for c in cell.split(",")
+                    if c.strip()
+                ]
+                if val.lower() not in countries:
                     include = False
                     break
 
@@ -184,21 +189,21 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Phase 6.2.3 — Board-aware filtering
+# Phase 6.2.3 — Board-aware filtering (FIXED)
 # -------------------------------
 def apply_board_filter(students: list, user_query: str) -> list:
     q = user_query.lower()
 
-    if "ib" in q or "ibdp" in q:
+    if "ib" in q:
         return [
             s for s in students
-            if s.get("12th Board", "").strip().upper() == "IBDP"
+            if "ib" in s.get("12th Board", "").lower()
         ]
 
     if "cbse" in q:
         return [
             s for s in students
-            if s.get("12th Board", "").strip().upper() == "CBSE"
+            if "cbse" in s.get("12th Board", "").lower()
         ]
 
     return students
@@ -222,7 +227,7 @@ def compute_analytics(students: list) -> dict:
     }
 
 # -------------------------------
-# Phase 6.2.3 — Analytics Narrator (NEW)
+# Phase 6.2.3 — Analytics Narrator
 # -------------------------------
 def handle_analytics_response(user_query: str, filters: dict, students: list) -> dict:
     count = len(students)
@@ -233,17 +238,13 @@ You are an international admissions data analyst.
 User question:
 "{user_query}"
 
-Applied filters:
-{json.dumps(filters, indent=2)}
-
 Result count:
 {count}
 
 Write a clear, direct answer:
 - Start with the numeric answer
-- Use one short explanatory sentence
-- No mention of databases or internal systems
-- Be neutral and factual
+- One short explanatory sentence
+- No mention of databases or systems
 """
 
     response = client_llm.chat.completions.create(
@@ -277,7 +278,6 @@ You are a senior international college counselor.
 
 The student wants advice, informed by general trends.
 Do NOT mention counts, percentages, or databases.
-Use patterns only as soft context.
 
 Student query:
 "{user_query}"
@@ -286,9 +286,9 @@ Contextual signals:
 {json.dumps(signals, indent=2)}
 
 Respond with:
-1. Understanding of the student's background
-2. Strategic advice
-3. Clear next steps
+1. Understanding
+2. Strategy
+3. Next steps
 """
 
     response = client_llm.chat.completions.create(
@@ -314,7 +314,6 @@ async def nl_query(req: ChatRequest):
     if intent == "advisory":
         return handle_advisory(req.message)
 
-    # ---------- Extract filters ----------
     prompt = f"""
 Convert the user query into JSON filters.
 
@@ -338,12 +337,10 @@ User query:
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
-    # Board-aware filtering
     students = apply_board_filter(students, req.message)
 
     analytics = compute_analytics(students)
 
-    # ✅ Phase 6.2.3 — Proper analytics answer
     if intent == "analytics":
         return handle_analytics_response(req.message, filters, students)
 
