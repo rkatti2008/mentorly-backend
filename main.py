@@ -58,7 +58,7 @@ class ChatRequest(BaseModel):
     message: str
 
 # -------------------------------
-# Phase 6.1 — Intent Classification
+# Phase 6 — Intent Classification
 # -------------------------------
 def classify_intent(user_query: str) -> str:
     q = user_query.lower()
@@ -75,13 +75,24 @@ def classify_intent(user_query: str) -> str:
         "what are my chances"
     ]
 
+    analytics_keywords = [
+        "how many",
+        "count",
+        "number of",
+        "statistics",
+        "analytics"
+    ]
+
     if any(k in q for k in advisory_keywords):
         return "advisory"
 
-    return "analytics"
+    if any(k in q for k in analytics_keywords):
+        return "analytics"
+
+    return "hybrid"
 
 # -------------------------------
-# Phase 6.1 — Counselor-only advice
+# Phase 6.1 — Pure Counselor Advice
 # -------------------------------
 def handle_advisory(user_query: str) -> dict:
     prompt = f"""
@@ -90,6 +101,7 @@ You are an experienced international college counselor.
 The student is asking for personal guidance.
 Do NOT mention databases, analytics, counts, or other students.
 Do NOT fabricate statistics.
+
 Respond like a real counselor:
 - Calm
 - Structured
@@ -179,52 +191,9 @@ def filter_students(records, query_params):
 
     for r in records:
 
-        if query_params.get("ib_board_only"):
-            if r.get("12th Board", "").strip().upper() != "IBDP":
-                continue
-
-        if query_params.get("cbse_board_only"):
-            if r.get("12th Board", "").strip().upper() != "CBSE":
-                continue
-
-        if query_params.get("ib_min_12") is not None or query_params.get("ib_max_12") is not None:
-            if r.get("12th Board", "").strip().upper() != "IBDP":
-                continue
-
-            if not passes_numeric_filter(
-                r.get("12th grade overall score"),
-                query_params.get("ib_min_12"),
-                query_params.get("ib_max_12"),
-            ):
-                continue
-
-        if sat_used:
-            if not passes_numeric_filter(
-                r.get("SAT Total score"),
-                query_params.get("SAT Total score_min"),
-                query_params.get("SAT Total score_max"),
-            ):
-                continue
-
-        if act_used:
-            if not passes_numeric_filter(
-                r.get("ACT Score"),
-                query_params.get("ACT Score_min"),
-                query_params.get("ACT Score_max"),
-            ):
-                continue
-
         include = True
 
         for key, val in query_params.items():
-            if key in [
-                "ib_board_only", "cbse_board_only",
-                "ib_min_12", "ib_max_12",
-                "SAT Total score_min", "SAT Total score_max",
-                "ACT Score_min", "ACT Score_max"
-            ]:
-                continue
-
             if val is None:
                 continue
 
@@ -235,30 +204,8 @@ def filter_students(records, query_params):
                     include = False
                     break
 
-            elif key.lower() == "city":
-                if r.get("City of Graduation", "").lower() != val.lower():
-                    include = False
-                    break
-
-            elif key.lower() == "admitted univs":
-                cell = r.get("Accepted Univ", "")
-                if isinstance(val, list):
-                    if not any(fuzzy_match(cell, v) for v in val):
-                        include = False
-                        break
-                else:
-                    if not fuzzy_match(cell, val):
-                        include = False
-                        break
-
             elif key.lower() == "countries applied to":
                 cell = r.get("Countries Applied To", "")
-                if not fuzzy_match(cell, val):
-                    include = False
-                    break
-
-            else:
-                cell = get_column_value(r, key)
                 if not fuzzy_match(cell, val):
                     include = False
                     break
@@ -284,10 +231,51 @@ def compute_analytics(students: list) -> dict:
             s.get("Intended Major", "").strip().lower()
             for s in students if s.get("Intended Major")
         ),
-        "admitted_universities": Counter(
-            s.get("Accepted Univ", "").strip().lower()
-            for s in students if s.get("Accepted Univ")
-        ),
+    }
+
+# -------------------------------
+# Phase 6.2.1 — Pattern → Advice Bridge
+# -------------------------------
+def summarize_signals(analytics: dict) -> dict:
+    if not analytics:
+        return {}
+
+    return {
+        "popular_countries": list(analytics.get("countries_applied", {}).keys()),
+        "common_majors": list(analytics.get("intended_majors", {}).keys())
+    }
+
+
+def handle_hybrid(user_query: str, signals: dict) -> dict:
+    prompt = f"""
+You are a senior international college counselor.
+
+The student wants advice, informed by general trends.
+Do NOT mention counts, percentages, or databases.
+Use patterns only as soft context.
+
+Student query:
+"{user_query}"
+
+Contextual signals:
+{json.dumps(signals, indent=2)}
+
+Respond with:
+1. Understanding of the student's background
+2. Strategic advice
+3. Clear next steps
+"""
+
+    response = client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.6,
+        max_tokens=450
+    )
+
+    return {
+        "intent": "hybrid",
+        "assistant_answer": response.choices[0].message.content.strip()
     }
 
 # -------------------------------
@@ -301,18 +289,13 @@ async def nl_query(req: ChatRequest):
     if intent == "advisory":
         return handle_advisory(req.message)
 
-    # ---------- Phase 5 analytics pipeline ----------
+    # ---------- Phase 5 filter extraction ----------
     prompt = f"""
 Convert the user query into JSON filters.
 
 Allowed keys:
-ib_min_12, ib_max_12,
-"SAT Total score_min", "SAT Total score_max",
-"ACT Score_min", "ACT Score_max",
 intended_major,
-admitted univs,
-countries applied to,
-city
+countries applied to
 
 User query:
 "{req.message}"
@@ -331,10 +314,14 @@ User query:
     students = filter_students(records, filters)
     analytics = compute_analytics(students)
 
-    return {
-        "intent": "analytics",
-        "interpreted_filters": filters,
-        "count": len(students),
-        "analytics": analytics,
-        "students": students
-    }
+    if intent == "analytics":
+        return {
+            "intent": "analytics",
+            "interpreted_filters": filters,
+            "count": len(students),
+            "analytics": analytics,
+            "students": students
+        }
+
+    signals = summarize_signals(analytics)
+    return handle_hybrid(req.message, signals)
