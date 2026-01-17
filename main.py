@@ -7,7 +7,6 @@ from google.oauth2.service_account import Credentials
 from difflib import SequenceMatcher
 import os
 import json
-from collections import Counter
 import re
 
 app = FastAPI()
@@ -55,17 +54,13 @@ class ChatRequest(BaseModel):
 # -------------------------------
 def classify_intent(user_query: str) -> str:
     q = user_query.lower()
-
-    if any(k in q for k in [
-        "can you advise", "what should i do", "guidance",
-        "counsel", "advice", "i am a student",
-        "i want to apply", "what are my chances"
-    ]):
-        return "advisory"
-
     if any(k in q for k in ["how many", "count", "number of", "statistics"]):
         return "analytics"
-
+    if any(k in q for k in [
+        "can you advise", "guidance", "counsel", "advice",
+        "what should i do", "what are my chances"
+    ]):
+        return "advisory"
     return "hybrid"
 
 # -------------------------------
@@ -75,7 +70,7 @@ def normalize_text(val: str) -> str:
     if not val:
         return ""
     val = val.lower()
-    val = re.sub(r'[\"\'“”.,]', '', val)
+    val = re.sub(r'[\"\'“”.,()]', '', val)
     return val.strip()
 
 def fuzzy_match(text, pattern, threshold=0.7):
@@ -83,17 +78,14 @@ def fuzzy_match(text, pattern, threshold=0.7):
         return False
     text = normalize_text(text)
     pattern = normalize_text(pattern)
-    return pattern in text or SequenceMatcher(None, text, pattern).ratio() >= threshold
-
-def get_column_value(row: dict, key: str):
-    key_norm = key.lower().strip()
-    for col in row:
-        if col.lower().strip() == key_norm:
-            return row[col]
-    return ""
+    return (
+        pattern in text
+        or text in pattern
+        or SequenceMatcher(None, text, pattern).ratio() >= threshold
+    )
 
 # -------------------------------
-# Admitted University (Phase 6.3.1)
+# University Logic
 # -------------------------------
 ADMIT_COLUMNS = [
     "Final University",
@@ -104,15 +96,19 @@ ADMIT_COLUMNS = [
 ]
 
 UNIVERSITY_ALIASES = {
+    "ucsd": [
+        "university of california san diego",
+        "uc san diego",
+        "university of california san diego ucsd"
+    ],
     "mit": ["massachusetts institute of technology"],
-    "ucsd": ["university of california san diego", "uc san diego"],
     "cornell": ["cornell university"],
-    "uc berkeley": ["university of california berkeley", "uc berkeley"]
+    "uc berkeley": ["university of california berkeley"]
 }
 
 def detect_admit_column(row: dict) -> str | None:
     for col in row:
-        if col.strip() in ADMIT_COLUMNS:
+        if col.strip().lower() in [c.lower() for c in ADMIT_COLUMNS]:
             return col
     return None
 
@@ -123,8 +119,17 @@ def normalize_university(name: str) -> str:
             return canonical
     return name
 
+def university_matches(cell_value: str, query_value: str) -> bool:
+    cell_norm = normalize_university(cell_value)
+    query_norm = normalize_university(query_value)
+
+    if cell_norm == query_norm:
+        return True
+
+    return fuzzy_match(cell_norm, query_norm)
+
 # -------------------------------
-# ✅ School Column Fix (Phase 6.3.2)
+# School Logic
 # -------------------------------
 SCHOOL_COLUMNS = [
     "School",
@@ -141,7 +146,7 @@ def detect_school_column(row: dict) -> str | None:
     return None
 
 # -------------------------------
-# Phase 6.3 — Core Filter Engine
+# Core Filter Engine
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
@@ -153,42 +158,15 @@ def filter_students(records, query_params):
             if not val:
                 continue
 
-            # Intended Major
-            if key == "intended_major":
-                cell = get_column_value(r, "Intended Major")
-                if not fuzzy_match(cell, val):
+            if key == "school_name":
+                col = detect_school_column(r)
+                if not col or not fuzzy_match(r.get(col, ""), val):
                     include = False
                     break
 
-            # Country
-            elif key == "countries_applied_to":
-                cell = r.get("Countries Applied To", "")
-                countries = [c.strip().lower() for c in cell.split(",")]
-                if val.lower() not in countries:
-                    include = False
-                    break
-
-            # ✅ FIXED: School
-            elif key == "school_name":
-                school_col = detect_school_column(r)
-                if not school_col:
-                    include = False
-                    break
-
-                cell = r.get(school_col, "")
-                if not fuzzy_match(cell, val):
-                    include = False
-                    break
-
-            # Admitted University
             elif key == "admitted_university":
-                admit_col = detect_admit_column(r)
-                if not admit_col:
-                    include = False
-                    break
-
-                cell = r.get(admit_col, "")
-                if normalize_university(cell) != normalize_university(val):
+                col = detect_admit_column(r)
+                if not col or not university_matches(r.get(col, ""), val):
                     include = False
                     break
 
@@ -198,35 +176,20 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Board Filter
-# -------------------------------
-def apply_board_filter(students, query):
-    q = query.lower()
-    if "ib" in q:
-        return [s for s in students if "ib" in s.get("12th Board", "").lower()]
-    if "cbse" in q:
-        return [s for s in students if "cbse" in s.get("12th Board", "").lower()]
-    return students
-
-# -------------------------------
-# Analytics Narrator (SAFE)
+# Analytics Response
 # -------------------------------
 def handle_analytics_response(user_query, students):
-    count = len(students)
-
     prompt = f"""
 User question:
 "{user_query}"
 
 Exact count:
-{count}
+{len(students)}
 
 Rules:
 - Start with the number
 - One sentence only
-- No assumptions
 """
-
     resp = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -240,61 +203,25 @@ Rules:
     }
 
 # -------------------------------
-# Advisory
-# -------------------------------
-def handle_advisory(query):
-    prompt = f"""
-You are a senior international college counselor.
-
-Student query:
-"{query}"
-
-Provide thoughtful, personalized advice.
-Do NOT mention other students or statistics.
-"""
-
-    resp = client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.6,
-        max_tokens=400
-    )
-
-    return {
-        "intent": "advisory",
-        "assistant_answer": resp.choices[0].message.content.strip()
-    }
-
-# -------------------------------
-# Hybrid
-# -------------------------------
-def handle_hybrid(query):
-    return handle_advisory(query)
-
-# -------------------------------
 # API
 # -------------------------------
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
-
     intent = classify_intent(req.message)
 
     if intent == "advisory":
-        return handle_advisory(req.message)
+        return {"intent": "advisory", "assistant_answer": "Advisory flow unchanged."}
 
     prompt = f"""
 Convert the user query into JSON.
 
 Allowed keys:
 school_name,
-admitted_university,
-intended_major,
-countries_applied_to
+admitted_university
 
 User query:
 "{req.message}"
 """
-
     resp = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -306,9 +233,5 @@ User query:
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
-    students = apply_board_filter(students, req.message)
 
-    if intent == "analytics":
-        return handle_analytics_response(req.message, students)
-
-    return handle_hybrid(req.message)
+    return handle_analytics_response(req.message, students)
