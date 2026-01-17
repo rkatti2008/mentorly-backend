@@ -57,8 +57,9 @@ def classify_intent(user_query: str) -> str:
     q = user_query.lower()
 
     if any(k in q for k in [
-        "can you advise", "what should i do", "guidance", "counsel",
-        "advice", "i am a student", "i want to apply", "what are my chances"
+        "can you advise", "what should i do", "guidance",
+        "counsel", "advice", "i am a student",
+        "i want to apply", "what are my chances"
     ]):
         return "advisory"
 
@@ -82,10 +83,10 @@ def get_column_value(row: dict, key: str):
     for col in row:
         if col.lower().strip() == key_norm:
             return row[col]
-    return None
+    return ""
 
 # -------------------------------
-# Core Filter Engine
+# Phase 6.3 — Core Filter Engine
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
@@ -97,18 +98,32 @@ def filter_students(records, query_params):
             if not val:
                 continue
 
-            if key.lower() == "intended_major":
-                majors = [m.strip() for m in val.split(",")]
+            # Intended Major
+            if key == "intended_major":
                 cell = get_column_value(r, "Intended Major")
-                if not any(fuzzy_match(cell, m) for m in majors):
+                if not fuzzy_match(cell, val):
                     include = False
                     break
 
-            elif key.lower() == "countries applied to":
+            # Country
+            elif key == "countries_applied_to":
                 cell = r.get("Countries Applied To", "")
-                countries = [c.strip().lower() for c in cell.split(",") if c.strip()]
-                vals = val if isinstance(val, list) else [val]
-                if not any(v.lower() in countries for v in vals):
+                countries = [c.strip().lower() for c in cell.split(",")]
+                if val.lower() not in countries:
+                    include = False
+                    break
+
+            # School
+            elif key == "school_name":
+                cell = get_column_value(r, "School")
+                if not fuzzy_match(cell, val):
+                    include = False
+                    break
+
+            # Final / Admitted University
+            elif key == "admitted_university":
+                cell = get_column_value(r, "Final University")
+                if not fuzzy_match(cell, val):
                     include = False
                     break
 
@@ -129,57 +144,67 @@ def apply_board_filter(students, query):
     return students
 
 # -------------------------------
-# 🚨 Phase 6.2.4 — Unsafe Analytics Guard
-# -------------------------------
-def mentions_unsupported_dimension(query: str) -> bool:
-    q = query.lower()
-
-    # crude but safe detection
-    school_words = ["school", "high", "dps", "greenwood"]
-    uni_words = ["mit", "harvard", "stanford", "cornell", "princeton"]
-
-    return any(w in q for w in school_words + uni_words)
-
-def safe_blocked_analytics_response():
-    return {
-        "intent": "analytics",
-        "assistant_answer": (
-            "I can’t answer this reliably yet because the current data filters "
-            "don’t support school- or university-specific counts. "
-            "You can ask about broader trends (by country, board, or major), "
-            "or we can extend the system to support this."
-        )
-    }
-
-# -------------------------------
-# Analytics Narrator
+# Analytics Narrator (SAFE)
 # -------------------------------
 def handle_analytics_response(user_query, students):
     count = len(students)
 
     prompt = f"""
-Answer the user's question clearly and factually.
-
-Question:
+User question:
 "{user_query}"
 
-Answer rules:
+Exact count:
+{count}
+
+Rules:
 - Start with the number
-- One short sentence
-- No speculation
+- One sentence only
+- No assumptions
 """
 
     resp = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=80
+        temperature=0,
+        max_tokens=60
     )
 
     return {
         "intent": "analytics",
         "assistant_answer": resp.choices[0].message.content.strip()
     }
+
+# -------------------------------
+# Advisory
+# -------------------------------
+def handle_advisory(query):
+    prompt = f"""
+You are a senior international college counselor.
+
+Student query:
+"{query}"
+
+Provide thoughtful, personalized advice.
+Do NOT mention other students or statistics.
+"""
+
+    resp = client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.6,
+        max_tokens=400
+    )
+
+    return {
+        "intent": "advisory",
+        "assistant_answer": resp.choices[0].message.content.strip()
+    }
+
+# -------------------------------
+# Hybrid
+# -------------------------------
+def handle_hybrid(query):
+    return handle_advisory(query)
 
 # -------------------------------
 # API
@@ -192,16 +217,14 @@ async def nl_query(req: ChatRequest):
     if intent == "advisory":
         return handle_advisory(req.message)
 
-    # 🚨 Block unsafe analytics
-    if intent == "analytics" and mentions_unsupported_dimension(req.message):
-        return safe_blocked_analytics_response()
-
     prompt = f"""
-Convert the user query into JSON filters.
+Convert the user query into JSON.
 
 Allowed keys:
+school_name,
+admitted_university,
 intended_major,
-countries applied to
+countries_applied_to
 
 User query:
 "{req.message}"
@@ -223,4 +246,4 @@ User query:
     if intent == "analytics":
         return handle_analytics_response(req.message, students)
 
-    return handle_hybrid(req.message, {})
+    return handle_hybrid(req.message)
