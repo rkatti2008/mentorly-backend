@@ -1,5 +1,5 @@
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from openai import OpenAI
 from pydantic import BaseModel
 import gspread
@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 import os
 import json
 from collections import Counter
+import re
 
 app = FastAPI()
 
@@ -32,11 +33,6 @@ app.add_middleware(
 SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
-if not SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
-if not SHEET_ID:
-    raise RuntimeError("SHEET_ID not set")
-
 creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
 creds = Credentials.from_service_account_info(
     creds_dict,
@@ -45,9 +41,6 @@ creds = Credentials.from_service_account_info(
 
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
-
-if not os.environ.get("OPENAI_API_KEY"):
-    raise RuntimeError("OPENAI_API_KEY not set")
 
 client_llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -58,76 +51,21 @@ class ChatRequest(BaseModel):
     message: str
 
 # -------------------------------
-# Phase 6 — Intent Classification
+# Intent Classification
 # -------------------------------
 def classify_intent(user_query: str) -> str:
     q = user_query.lower()
 
-    advisory_keywords = [
-        "can you advise",
-        "what should i do",
-        "guidance",
-        "counsel",
-        "advice",
-        "i am a student",
-        "i want to apply",
-        "help me choose",
-        "what are my chances"
-    ]
-
-    analytics_keywords = [
-        "how many",
-        "count",
-        "number of",
-        "statistics",
-        "analytics"
-    ]
-
-    if any(k in q for k in advisory_keywords):
+    if any(k in q for k in [
+        "can you advise", "what should i do", "guidance", "counsel",
+        "advice", "i am a student", "i want to apply", "what are my chances"
+    ]):
         return "advisory"
 
-    if any(k in q for k in analytics_keywords):
+    if any(k in q for k in ["how many", "count", "number of", "statistics"]):
         return "analytics"
 
     return "hybrid"
-
-# -------------------------------
-# Phase 6.1 — Pure Counselor Advice
-# -------------------------------
-def handle_advisory(user_query: str) -> dict:
-    prompt = f"""
-You are an experienced international college counselor.
-
-The student is asking for personal guidance.
-Do NOT mention databases, analytics, counts, or other students.
-Do NOT fabricate statistics.
-
-Respond like a real counselor:
-- Calm
-- Structured
-- Encouraging
-- Action-oriented
-
-Student query:
-"{user_query}"
-
-Provide:
-1. Short reassurance
-2. Key considerations
-3. Next concrete steps
-"""
-
-    response = client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=400
-    )
-
-    return {
-        "intent": "advisory",
-        "assistant_answer": response.choices[0].message.content.strip()
-    }
 
 # -------------------------------
 # Helpers
@@ -135,15 +73,9 @@ Provide:
 def fuzzy_match(text, pattern, threshold=0.7):
     if not text or not pattern:
         return False
-
     text = str(text).lower()
     pattern = str(pattern).lower()
-
-    if pattern in text:
-        return True
-
-    return SequenceMatcher(None, text, pattern).ratio() >= threshold
-
+    return pattern in text or SequenceMatcher(None, text, pattern).ratio() >= threshold
 
 def get_column_value(row: dict, key: str):
     key_norm = key.lower().strip()
@@ -153,7 +85,7 @@ def get_column_value(row: dict, key: str):
     return None
 
 # -------------------------------
-# Core filter engine (FIXED)
+# Core Filter Engine
 # -------------------------------
 def filter_students(records, query_params):
     filtered = []
@@ -162,7 +94,7 @@ def filter_students(records, query_params):
         include = True
 
         for key, val in query_params.items():
-            if val is None:
+            if not val:
                 continue
 
             if key.lower() == "intended_major":
@@ -174,19 +106,9 @@ def filter_students(records, query_params):
 
             elif key.lower() == "countries applied to":
                 cell = r.get("Countries Applied To", "")
-                countries = [
-                    c.strip().lower()
-                    for c in cell.split(",")
-                    if c.strip()
-                ]
-
-                # ✅ FIX: normalize val (string OR list)
-                if isinstance(val, list):
-                    vals = [v.lower() for v in val]
-                else:
-                    vals = [val.lower()]
-
-                if not any(v in countries for v in vals):
+                countries = [c.strip().lower() for c in cell.split(",") if c.strip()]
+                vals = val if isinstance(val, list) else [val]
+                if not any(v.lower() in countries for v in vals):
                     include = False
                     break
 
@@ -196,118 +118,67 @@ def filter_students(records, query_params):
     return filtered
 
 # -------------------------------
-# Phase 6.2.3 — Board-aware filtering
+# Board Filter
 # -------------------------------
-def apply_board_filter(students: list, user_query: str) -> list:
-    q = user_query.lower()
-
+def apply_board_filter(students, query):
+    q = query.lower()
     if "ib" in q:
-        return [
-            s for s in students
-            if "ib" in s.get("12th Board", "").lower()
-        ]
-
+        return [s for s in students if "ib" in s.get("12th Board", "").lower()]
     if "cbse" in q:
-        return [
-            s for s in students
-            if "cbse" in s.get("12th Board", "").lower()
-        ]
-
+        return [s for s in students if "cbse" in s.get("12th Board", "").lower()]
     return students
 
 # -------------------------------
-# Analytics
+# 🚨 Phase 6.2.4 — Unsafe Analytics Guard
 # -------------------------------
-def compute_analytics(students: list) -> dict:
-    if not students:
-        return {}
+def mentions_unsupported_dimension(query: str) -> bool:
+    q = query.lower()
 
+    # crude but safe detection
+    school_words = ["school", "high", "dps", "greenwood"]
+    uni_words = ["mit", "harvard", "stanford", "cornell", "princeton"]
+
+    return any(w in q for w in school_words + uni_words)
+
+def safe_blocked_analytics_response():
     return {
-        "countries_applied": Counter(
-            s.get("Countries Applied To", "").strip().lower()
-            for s in students if s.get("Countries Applied To")
-        ),
-        "intended_majors": Counter(
-            s.get("Intended Major", "").strip().lower()
-            for s in students if s.get("Intended Major")
-        ),
+        "intent": "analytics",
+        "assistant_answer": (
+            "I can’t answer this reliably yet because the current data filters "
+            "don’t support school- or university-specific counts. "
+            "You can ask about broader trends (by country, board, or major), "
+            "or we can extend the system to support this."
+        )
     }
 
 # -------------------------------
-# Phase 6.2.3 — Analytics Narrator
+# Analytics Narrator
 # -------------------------------
-def handle_analytics_response(user_query: str, filters: dict, students: list) -> dict:
+def handle_analytics_response(user_query, students):
     count = len(students)
 
     prompt = f"""
-You are an international admissions data analyst.
+Answer the user's question clearly and factually.
 
-User question:
+Question:
 "{user_query}"
 
-Result count:
-{count}
-
-Write a clear, direct answer:
-- Start with the numeric answer
-- One short explanatory sentence
-- No mention of databases or systems
+Answer rules:
+- Start with the number
+- One short sentence
+- No speculation
 """
 
-    response = client_llm.chat.completions.create(
+    resp = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=120
+        temperature=0.2,
+        max_tokens=80
     )
 
     return {
         "intent": "analytics",
-        "assistant_answer": response.choices[0].message.content.strip()
-    }
-
-# -------------------------------
-# Phase 6.2.1 — Pattern → Advice Bridge
-# -------------------------------
-def summarize_signals(analytics: dict) -> dict:
-    if not analytics:
-        return {}
-
-    return {
-        "popular_countries": list(analytics.get("countries_applied", {}).keys()),
-        "common_majors": list(analytics.get("intended_majors", {}).keys())
-    }
-
-
-def handle_hybrid(user_query: str, signals: dict) -> dict:
-    prompt = f"""
-You are a senior international college counselor.
-
-The student wants advice, informed by general trends.
-Do NOT mention counts, percentages, or databases.
-
-Student query:
-"{user_query}"
-
-Contextual signals:
-{json.dumps(signals, indent=2)}
-
-Respond with:
-1. Understanding
-2. Strategy
-3. Next steps
-"""
-
-    response = client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.6,
-        max_tokens=450
-    )
-
-    return {
-        "intent": "hybrid",
-        "assistant_answer": response.choices[0].message.content.strip()
+        "assistant_answer": resp.choices[0].message.content.strip()
     }
 
 # -------------------------------
@@ -321,6 +192,10 @@ async def nl_query(req: ChatRequest):
     if intent == "advisory":
         return handle_advisory(req.message)
 
+    # 🚨 Block unsafe analytics
+    if intent == "analytics" and mentions_unsupported_dimension(req.message):
+        return safe_blocked_analytics_response()
+
     prompt = f"""
 Convert the user query into JSON filters.
 
@@ -332,24 +207,20 @@ User query:
 "{req.message}"
 """
 
-    response = client_llm.chat.completions.create(
+    resp = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
 
-    raw = response.choices[0].message.content
+    raw = resp.choices[0].message.content
     filters = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
-
     students = apply_board_filter(students, req.message)
 
-    analytics = compute_analytics(students)
-
     if intent == "analytics":
-        return handle_analytics_response(req.message, filters, students)
+        return handle_analytics_response(req.message, students)
 
-    signals = summarize_signals(analytics)
-    return handle_hybrid(req.message, signals)
+    return handle_hybrid(req.message, {})
