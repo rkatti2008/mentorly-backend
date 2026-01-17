@@ -52,40 +52,37 @@ class ChatRequest(BaseModel):
 # -------------------------------
 # Intent Classification
 # -------------------------------
-def classify_intent(user_query: str) -> str:
-    q = user_query.lower()
+def classify_intent(q: str) -> str:
+    q = q.lower()
     if any(k in q for k in ["how many", "count", "number of", "statistics"]):
         return "analytics"
-    if any(k in q for k in [
-        "can you advise", "guidance", "counsel", "advice",
-        "what should i do", "what are my chances"
-    ]):
+    if any(k in q for k in ["advice", "guidance", "counsel", "what should i do"]):
         return "advisory"
     return "hybrid"
 
 # -------------------------------
-# Helpers
+# Text Helpers
 # -------------------------------
-def normalize_text(val: str) -> str:
-    if not val:
+def normalize(text: str) -> str:
+    if not text:
         return ""
-    val = val.lower()
-    val = re.sub(r'[\"\'“”.,()]', '', val)
-    return val.strip()
+    text = text.lower()
+    text = re.sub(r'[\"\'“”.,()\-]', '', text)
+    return text.strip()
 
-def fuzzy_match(text, pattern, threshold=0.7):
-    if not text or not pattern:
+def fuzzy_match(a: str, b: str, threshold=0.72) -> bool:
+    a = normalize(a)
+    b = normalize(b)
+    if not a or not b:
         return False
-    text = normalize_text(text)
-    pattern = normalize_text(pattern)
     return (
-        pattern in text
-        or text in pattern
-        or SequenceMatcher(None, text, pattern).ratio() >= threshold
+        b in a
+        or a in b
+        or SequenceMatcher(None, a, b).ratio() >= threshold
     )
 
 # -------------------------------
-# University Logic
+# University Normalization
 # -------------------------------
 UNIVERSITY_ALIASES = {
     "ucsd": [
@@ -98,113 +95,59 @@ UNIVERSITY_ALIASES = {
     "uc berkeley": ["university of california berkeley", "uc berkeley"]
 }
 
-def normalize_university(name: str) -> str:
-    name = normalize_text(name)
-    for canonical, aliases in UNIVERSITY_ALIASES.items():
-        if name == canonical or name in aliases:
-            return canonical
-    return name
-
-def university_matches(cell_value: str, query_value: str) -> bool:
-    cell_norm = normalize_university(cell_value)
-    query_norm = normalize_university(query_value)
-
-    if cell_norm == query_norm:
-        return True
-
-    return fuzzy_match(cell_norm, query_norm)
+def normalize_university(val: str) -> str:
+    val = normalize(val)
+    for canon, aliases in UNIVERSITY_ALIASES.items():
+        if val == canon or val in aliases:
+            return canon
+    return val
 
 # -------------------------------
-# ✅ FIXED: Robust Admit Column Detection
+# ✅ TRUE FIX: ROW-WIDE SEARCH
 # -------------------------------
-def detect_admit_column(row: dict) -> str | None:
-    """
-    Robustly detect final admitted university column.
-    Handles real-world Google Sheet headers.
-    """
+def row_contains_value(row: dict, query: str) -> bool:
+    for cell in row.values():
+        if fuzzy_match(str(cell), query):
+            return True
+    return False
 
-    priority_keywords = [
-        "final",
-        "attend",
-        "admit",
-        "committed"
-    ]
-
-    fallback_keywords = [
-        "university",
-        "college"
-    ]
-
-    cols = list(row.keys())
-
-    # Strong signals first
-    for col in cols:
-        col_norm = col.lower()
-        if any(k in col_norm for k in priority_keywords):
-            return col
-
-    # Fallback
-    for col in cols:
-        col_norm = col.lower()
-        if any(k in col_norm for k in fallback_keywords):
-            return col
-
-    return None
+def row_contains_university(row: dict, query: str) -> bool:
+    q_norm = normalize_university(query)
+    for cell in row.values():
+        cell_norm = normalize_university(str(cell))
+        if fuzzy_match(cell_norm, q_norm):
+            return True
+    return False
 
 # -------------------------------
-# School Logic
+# Core Filter Engine (FINAL)
 # -------------------------------
-SCHOOL_COLUMNS = [
-    "School",
-    "12th School",
-    "High School",
-    "School Name",
-    "Secondary School"
-]
+def filter_students(records, filters):
+    result = []
 
-def detect_school_column(row: dict) -> str | None:
-    for col in row:
-        if col.strip().lower() in [c.lower() for c in SCHOOL_COLUMNS]:
-            return col
-    return None
+    for row in records:
+        ok = True
 
-# -------------------------------
-# Core Filter Engine
-# -------------------------------
-def filter_students(records, query_params):
-    filtered = []
+        if "school_name" in filters:
+            if not row_contains_value(row, filters["school_name"]):
+                ok = False
 
-    for r in records:
-        include = True
+        if ok and "admitted_university" in filters:
+            if not row_contains_university(row, filters["admitted_university"]):
+                ok = False
 
-        for key, val in query_params.items():
-            if not val:
-                continue
+        if ok:
+            result.append(row)
 
-            if key == "school_name":
-                col = detect_school_column(r)
-                if not col or not fuzzy_match(r.get(col, ""), val):
-                    include = False
-                    break
-
-            elif key == "admitted_university":
-                col = detect_admit_column(r)
-                if not col or not university_matches(r.get(col, ""), val):
-                    include = False
-                    break
-
-        if include:
-            filtered.append(r)
-
-    return filtered
+    return result
 
 # -------------------------------
 # Analytics Response
 # -------------------------------
-def handle_analytics_response(user_query, students):
+def handle_analytics_response(query, students):
     prompt = f"""
 User question:
-"{user_query}"
+"{query}"
 
 Exact count:
 {len(students)}
