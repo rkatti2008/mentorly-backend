@@ -103,7 +103,7 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# ✅ TRUE FIX: ROW-WIDE SEARCH
+# ROW-WIDE SEARCH (FINAL FIX)
 # -------------------------------
 def row_contains_value(row: dict, query: str) -> bool:
     for cell in row.values():
@@ -113,14 +113,22 @@ def row_contains_value(row: dict, query: str) -> bool:
 
 def row_contains_university(row: dict, query: str) -> bool:
     q_norm = normalize_university(query)
+
     for cell in row.values():
-        cell_norm = normalize_university(str(cell))
-        if fuzzy_match(cell_norm, q_norm):
+        cell_text = normalize(str(cell))
+
+        # ✅ Strong containment check (fixes Cornell)
+        if q_norm in cell_text:
             return True
+
+        # Fallback fuzzy match
+        if fuzzy_match(cell_text, q_norm):
+            return True
+
     return False
 
 # -------------------------------
-# Core Filter Engine (FINAL)
+# Core Filter Engine
 # -------------------------------
 def filter_students(records, filters):
     result = []
