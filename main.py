@@ -93,7 +93,7 @@ def get_column_value(row: dict, key: str):
     return ""
 
 # -------------------------------
-# Admitted University Fix (Phase 6.3.1)
+# Admitted University (Phase 6.3.1)
 # -------------------------------
 ADMIT_COLUMNS = [
     "Final University",
@@ -124,6 +124,23 @@ def normalize_university(name: str) -> str:
     return name
 
 # -------------------------------
+# ✅ School Column Fix (Phase 6.3.2)
+# -------------------------------
+SCHOOL_COLUMNS = [
+    "School",
+    "12th School",
+    "High School",
+    "School Name",
+    "Secondary School"
+]
+
+def detect_school_column(row: dict) -> str | None:
+    for col in row:
+        if col.strip().lower() in [c.lower() for c in SCHOOL_COLUMNS]:
+            return col
+    return None
+
+# -------------------------------
 # Phase 6.3 — Core Filter Engine
 # -------------------------------
 def filter_students(records, query_params):
@@ -151,14 +168,19 @@ def filter_students(records, query_params):
                     include = False
                     break
 
-            # School
+            # ✅ FIXED: School
             elif key == "school_name":
-                cell = get_column_value(r, "School")
+                school_col = detect_school_column(r)
+                if not school_col:
+                    include = False
+                    break
+
+                cell = r.get(school_col, "")
                 if not fuzzy_match(cell, val):
                     include = False
                     break
 
-            # ✅ FIXED: Admitted University
+            # Admitted University
             elif key == "admitted_university":
                 admit_col = detect_admit_column(r)
                 if not admit_col:
