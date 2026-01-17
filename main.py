@@ -71,11 +71,18 @@ def classify_intent(user_query: str) -> str:
 # -------------------------------
 # Helpers
 # -------------------------------
+def normalize_text(val: str) -> str:
+    if not val:
+        return ""
+    val = val.lower()
+    val = re.sub(r'[\"\'“”.,]', '', val)
+    return val.strip()
+
 def fuzzy_match(text, pattern, threshold=0.7):
     if not text or not pattern:
         return False
-    text = str(text).lower()
-    pattern = str(pattern).lower()
+    text = normalize_text(text)
+    pattern = normalize_text(pattern)
     return pattern in text or SequenceMatcher(None, text, pattern).ratio() >= threshold
 
 def get_column_value(row: dict, key: str):
@@ -84,6 +91,37 @@ def get_column_value(row: dict, key: str):
         if col.lower().strip() == key_norm:
             return row[col]
     return ""
+
+# -------------------------------
+# Admitted University Fix (Phase 6.3.1)
+# -------------------------------
+ADMIT_COLUMNS = [
+    "Final University",
+    "University Admitted",
+    "Admitted To",
+    "College",
+    "University"
+]
+
+UNIVERSITY_ALIASES = {
+    "mit": ["massachusetts institute of technology"],
+    "ucsd": ["university of california san diego", "uc san diego"],
+    "cornell": ["cornell university"],
+    "uc berkeley": ["university of california berkeley", "uc berkeley"]
+}
+
+def detect_admit_column(row: dict) -> str | None:
+    for col in row:
+        if col.strip() in ADMIT_COLUMNS:
+            return col
+    return None
+
+def normalize_university(name: str) -> str:
+    name = normalize_text(name)
+    for canonical, aliases in UNIVERSITY_ALIASES.items():
+        if name == canonical or name in aliases:
+            return canonical
+    return name
 
 # -------------------------------
 # Phase 6.3 — Core Filter Engine
@@ -120,10 +158,15 @@ def filter_students(records, query_params):
                     include = False
                     break
 
-            # Final / Admitted University
+            # ✅ FIXED: Admitted University
             elif key == "admitted_university":
-                cell = get_column_value(r, "Final University")
-                if not fuzzy_match(cell, val):
+                admit_col = detect_admit_column(r)
+                if not admit_col:
+                    include = False
+                    break
+
+                cell = r.get(admit_col, "")
+                if normalize_university(cell) != normalize_university(val):
                     include = False
                     break
 
