@@ -87,14 +87,6 @@ def fuzzy_match(text, pattern, threshold=0.7):
 # -------------------------------
 # University Logic
 # -------------------------------
-ADMIT_COLUMNS = [
-    "Final University",
-    "University Admitted",
-    "Admitted To",
-    "College",
-    "University"
-]
-
 UNIVERSITY_ALIASES = {
     "ucsd": [
         "university of california san diego",
@@ -103,14 +95,8 @@ UNIVERSITY_ALIASES = {
     ],
     "mit": ["massachusetts institute of technology"],
     "cornell": ["cornell university"],
-    "uc berkeley": ["university of california berkeley"]
+    "uc berkeley": ["university of california berkeley", "uc berkeley"]
 }
-
-def detect_admit_column(row: dict) -> str | None:
-    for col in row:
-        if col.strip().lower() in [c.lower() for c in ADMIT_COLUMNS]:
-            return col
-    return None
 
 def normalize_university(name: str) -> str:
     name = normalize_text(name)
@@ -127,6 +113,43 @@ def university_matches(cell_value: str, query_value: str) -> bool:
         return True
 
     return fuzzy_match(cell_norm, query_norm)
+
+# -------------------------------
+# ✅ FIXED: Robust Admit Column Detection
+# -------------------------------
+def detect_admit_column(row: dict) -> str | None:
+    """
+    Robustly detect final admitted university column.
+    Handles real-world Google Sheet headers.
+    """
+
+    priority_keywords = [
+        "final",
+        "attend",
+        "admit",
+        "committed"
+    ]
+
+    fallback_keywords = [
+        "university",
+        "college"
+    ]
+
+    cols = list(row.keys())
+
+    # Strong signals first
+    for col in cols:
+        col_norm = col.lower()
+        if any(k in col_norm for k in priority_keywords):
+            return col
+
+    # Fallback
+    for col in cols:
+        col_norm = col.lower()
+        if any(k in col_norm for k in fallback_keywords):
+            return col
+
+    return None
 
 # -------------------------------
 # School Logic
@@ -210,7 +233,10 @@ async def nl_query(req: ChatRequest):
     intent = classify_intent(req.message)
 
     if intent == "advisory":
-        return {"intent": "advisory", "assistant_answer": "Advisory flow unchanged."}
+        return {
+            "intent": "advisory",
+            "assistant_answer": "Advisory flow unchanged."
+        }
 
     prompt = f"""
 Convert the user query into JSON.
