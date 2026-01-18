@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
 import os, json, re
+from collections import Counter
 
 app = FastAPI()
 
@@ -41,7 +42,7 @@ class ChatRequest(BaseModel):
     message: str
 
 # -------------------------------
-# Intent Classification
+# Intent + Mode Classification
 # -------------------------------
 def classify_intent(q: str) -> str:
     q = q.lower()
@@ -50,6 +51,12 @@ def classify_intent(q: str) -> str:
     if any(k in q for k in ["advice", "guidance", "counsel"]):
         return "advisory"
     return "hybrid"
+
+def classify_mode(q: str) -> str:
+    q = q.lower()
+    if any(k in q for k in ["why", "how do", "is it possible", "chances", "realistic"]):
+        return "hybrid"
+    return "analytics"
 
 # -------------------------------
 # Text Helpers
@@ -81,7 +88,7 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# School Column Logic (NEW FIX)
+# School Column Logic
 # -------------------------------
 SCHOOL_COLUMN_HINTS = ["school", "high", "secondary"]
 
@@ -110,9 +117,6 @@ def is_admit_column(col_name: str) -> bool:
         return False
     return any(good in col for good in ADMIT_INCLUDE_HINTS)
 
-# -------------------------------
-# FINAL ADMIT MATCH (STRICT)
-# -------------------------------
 def extract_universities(cell: str):
     return [
         normalize_university(p.strip())
@@ -122,25 +126,19 @@ def extract_universities(cell: str):
 
 def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
-
     for col, cell in row.items():
         if not is_admit_column(col):
             continue
-
         universities = extract_universities(cell)
-
-        # EXACTLY one final admit, and it must match
         if len(universities) == 1 and universities[0] == target:
             return True
-
     return False
 
 # -------------------------------
-# Core Filter Engine (FINAL)
+# Core Filter Engine
 # -------------------------------
 def filter_students(records, filters):
     result = []
-
     for row in records:
         ok = True
 
@@ -158,13 +156,48 @@ def filter_students(records, filters):
     return result
 
 # -------------------------------
-# Analytics Response
+# Phase 7: Explainable Summaries
 # -------------------------------
-def handle_analytics_response(query, students):
+def summarize_patterns(students):
+    boards = Counter()
+    schools = Counter()
+
+    for s in students:
+        boards[s.get("12th Board", "Unknown")] += 1
+        schools[s.get("School", "Unknown")] += 1
+
     return {
-        "intent": "analytics",
-        "assistant_answer": f"{len(students)} students match the criteria."
+        "top_boards": [b for b, _ in boards.most_common(2)],
+        "top_schools": [s for s, _ in schools.most_common(2)]
     }
+
+# -------------------------------
+# Responses
+# -------------------------------
+def analytics_response(students):
+    if len(students) == 0:
+        return "0 students match the criteria. No final admits are recorded for this combination in the database."
+    return f"{len(students)} students match the criteria."
+
+def hybrid_response(summary):
+    prompt = f"""
+Facts (do not invent anything):
+- Boards seen: {summary['top_boards']}
+- Schools seen: {summary['top_schools']}
+
+Rules:
+- No numbers
+- No guarantees
+- Use cautious language like "tend to", "typically"
+
+Generate a short explanatory insight.
+"""
+
+    return client_llm.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    ).choices[0].message.content.strip()
 
 # -------------------------------
 # API
@@ -173,6 +206,7 @@ def handle_analytics_response(query, students):
 async def nl_query(req: ChatRequest):
     user_query = clean_user_query(req.message)
     intent = classify_intent(user_query)
+    mode = classify_mode(user_query)
 
     if intent == "advisory":
         return {
@@ -202,4 +236,13 @@ User query:
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
-    return handle_analytics_response(user_query, students)
+    if mode == "hybrid":
+        summary = summarize_patterns(students)
+        answer = hybrid_response(summary)
+    else:
+        answer = analytics_response(students)
+
+    return {
+        "intent": intent,
+        "assistant_answer": answer
+    }
