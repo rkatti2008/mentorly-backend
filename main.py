@@ -112,20 +112,33 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# ✅ ADMISSION COLUMN GUARD (CRITICAL FIX)
+# ✅ FINAL ADMISSION COLUMN LOGIC (CORRECT)
 # -------------------------------
-ADMIT_COLUMN_HINTS = [
+ADMIT_INCLUDE_HINTS = [
     "admit",
+    "admitted",
     "final",
-    "result",
     "decision",
-    "college",
-    "university"
+    "result"
+]
+
+ADMIT_EXCLUDE_HINTS = [
+    "applied",
+    "application",
+    "preference",
+    "choice",
+    "list"
 ]
 
 def is_admit_column(col_name: str) -> bool:
     col = normalize(col_name)
-    return any(hint in col for hint in ADMIT_COLUMN_HINTS)
+
+    # ❌ Never count applied / preference columns
+    if any(bad in col for bad in ADMIT_EXCLUDE_HINTS):
+        return False
+
+    # ✅ Only explicit admission outcome columns
+    return any(good in col for good in ADMIT_INCLUDE_HINTS)
 
 # -------------------------------
 # Row Matching
@@ -141,7 +154,7 @@ def row_contains_university(row: dict, query: str) -> bool:
 
     for col_name, cell in row.items():
         if not is_admit_column(col_name):
-            continue  # 🔒 prevents counting "applied to" cases
+            continue  # 🔒 prevents "applied to" false positives
 
         cell_text = normalize(str(cell))
 
