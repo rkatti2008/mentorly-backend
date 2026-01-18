@@ -82,7 +82,7 @@ def fuzzy_match(a: str, b: str, threshold=0.72) -> bool:
     )
 
 # -------------------------------
-# ✅ NEW: Clean user query (fixes quoted input)
+# Clean user query (quoted input fix)
 # -------------------------------
 def clean_user_query(q: str) -> str:
     q = q.strip()
@@ -112,7 +112,23 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# ROW-WIDE SEARCH (FINAL FIX)
+# ✅ ADMISSION COLUMN GUARD (CRITICAL FIX)
+# -------------------------------
+ADMIT_COLUMN_HINTS = [
+    "admit",
+    "final",
+    "result",
+    "decision",
+    "college",
+    "university"
+]
+
+def is_admit_column(col_name: str) -> bool:
+    col = normalize(col_name)
+    return any(hint in col for hint in ADMIT_COLUMN_HINTS)
+
+# -------------------------------
+# Row Matching
 # -------------------------------
 def row_contains_value(row: dict, query: str) -> bool:
     for cell in row.values():
@@ -123,10 +139,12 @@ def row_contains_value(row: dict, query: str) -> bool:
 def row_contains_university(row: dict, query: str) -> bool:
     q_norm = normalize_university(query)
 
-    for cell in row.values():
+    for col_name, cell in row.items():
+        if not is_admit_column(col_name):
+            continue  # 🔒 prevents counting "applied to" cases
+
         cell_text = normalize(str(cell))
 
-        # Strong containment (Cornell / UCSD safe)
         if q_norm in cell_text:
             return True
 
@@ -216,14 +234,9 @@ User query:
 
     raw = resp.choices[0].message.content
 
-    # ✅ Robust JSON extraction (critical fix)
     match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        filters = {}
-    else:
-        filters = json.loads(match.group())
+    filters = json.loads(match.group()) if match else {}
 
-    # ✅ Defensive normalization of extracted filters
     for k, v in filters.items():
         if isinstance(v, str):
             filters[k] = normalize(v)
