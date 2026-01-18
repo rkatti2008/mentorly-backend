@@ -82,6 +82,15 @@ def fuzzy_match(a: str, b: str, threshold=0.72) -> bool:
     )
 
 # -------------------------------
+# ✅ NEW: Clean user query (fixes quoted input)
+# -------------------------------
+def clean_user_query(q: str) -> str:
+    q = q.strip()
+    if (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'")):
+        q = q[1:-1]
+    return q.strip()
+
+# -------------------------------
 # University Normalization
 # -------------------------------
 UNIVERSITY_ALIASES = {
@@ -117,11 +126,10 @@ def row_contains_university(row: dict, query: str) -> bool:
     for cell in row.values():
         cell_text = normalize(str(cell))
 
-        # ✅ Strong containment check (fixes Cornell)
+        # Strong containment (Cornell / UCSD safe)
         if q_norm in cell_text:
             return True
 
-        # Fallback fuzzy match
         if fuzzy_match(cell_text, q_norm):
             return True
 
@@ -181,7 +189,8 @@ Rules:
 # -------------------------------
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
-    intent = classify_intent(req.message)
+    user_query = clean_user_query(req.message)
+    intent = classify_intent(user_query)
 
     if intent == "advisory":
         return {
@@ -197,7 +206,7 @@ school_name,
 admitted_university
 
 User query:
-"{req.message}"
+"{user_query}"
 """
     resp = client_llm.chat.completions.create(
         model="gpt-4o-mini",
@@ -206,9 +215,20 @@ User query:
     )
 
     raw = resp.choices[0].message.content
-    filters = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+
+    # ✅ Robust JSON extraction (critical fix)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        filters = {}
+    else:
+        filters = json.loads(match.group())
+
+    # ✅ Defensive normalization of extracted filters
+    for k, v in filters.items():
+        if isinstance(v, str):
+            filters[k] = normalize(v)
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
-    return handle_analytics_response(req.message, students)
+    return handle_analytics_response(user_query, students)
