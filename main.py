@@ -58,7 +58,10 @@ def normalize(text: str) -> str:
     return re.sub(r'[\"\'“”.,()\-]', '', str(text).lower()).strip()
 
 def clean_user_query(q: str) -> str:
-    return q.strip().strip('"').strip("'")
+    q = q.strip()
+    if (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'")):
+        q = q[1:-1]
+    return q.strip()
 
 # -------------------------------
 # University Canonicalization
@@ -78,6 +81,24 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
+# School Column Logic (NEW FIX)
+# -------------------------------
+SCHOOL_COLUMN_HINTS = ["school", "high", "secondary"]
+
+def is_school_column(col_name: str) -> bool:
+    col = normalize(col_name)
+    return any(hint in col for hint in SCHOOL_COLUMN_HINTS)
+
+def row_has_school(row: dict, school: str) -> bool:
+    target = normalize(school)
+    for col, cell in row.items():
+        if not is_school_column(col):
+            continue
+        if target in normalize(cell):
+            return True
+    return False
+
+# -------------------------------
 # FINAL ADMIT COLUMN LOCK
 # -------------------------------
 ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision", "result"]
@@ -90,7 +111,7 @@ def is_admit_column(col_name: str) -> bool:
     return any(good in col for good in ADMIT_INCLUDE_HINTS)
 
 # -------------------------------
-# FINAL ADMIT MATCH (CRITICAL FIX)
+# FINAL ADMIT MATCH (STRICT)
 # -------------------------------
 def extract_universities(cell: str):
     return [
@@ -108,14 +129,14 @@ def row_has_final_admit(row: dict, university: str) -> bool:
 
         universities = extract_universities(cell)
 
-        # ✅ MUST be exactly ONE final admit
+        # EXACTLY one final admit, and it must match
         if len(universities) == 1 and universities[0] == target:
             return True
 
     return False
 
 # -------------------------------
-# Core Filter Engine
+# Core Filter Engine (FINAL)
 # -------------------------------
 def filter_students(records, filters):
     result = []
@@ -123,7 +144,11 @@ def filter_students(records, filters):
     for row in records:
         ok = True
 
-        if "admitted_university" in filters:
+        if "school_name" in filters:
+            if not row_has_school(row, filters["school_name"]):
+                ok = False
+
+        if ok and "admitted_university" in filters:
             if not row_has_final_admit(row, filters["admitted_university"]):
                 ok = False
 
@@ -138,7 +163,7 @@ def filter_students(records, filters):
 def handle_analytics_response(query, students):
     return {
         "intent": "analytics",
-        "assistant_answer": f"{len(students)} students got into {query.split('into')[-1].strip()}."
+        "assistant_answer": f"{len(students)} students match the criteria."
     }
 
 # -------------------------------
@@ -157,8 +182,12 @@ async def nl_query(req: ChatRequest):
 
     prompt = f"""
 Convert the user query into JSON.
-Allowed keys: admitted_university
-User query: "{user_query}"
+Allowed keys:
+school_name,
+admitted_university
+
+User query:
+"{user_query}"
 """
 
     raw = client_llm.chat.completions.create(
