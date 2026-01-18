@@ -4,10 +4,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
-from difflib import SequenceMatcher
-import os
-import json
-import re
+import os, json, re
 
 app = FastAPI()
 
@@ -29,19 +26,13 @@ app.add_middleware(
 # -------------------------------
 # Google Sheets Setup
 # -------------------------------
-SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-SHEET_ID = os.environ.get("SHEET_ID")
-
-creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
+creds_dict = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 creds = Credentials.from_service_account_info(
     creds_dict,
     scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
 )
-
-client = gspread.authorize(creds)
-sheet = client.open_by_key(SHEET_ID).sheet1
-
-client_llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+sheet = gspread.authorize(creds).open_by_key(os.environ["SHEET_ID"]).sheet1
+client_llm = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # -------------------------------
 # Models
@@ -54,9 +45,9 @@ class ChatRequest(BaseModel):
 # -------------------------------
 def classify_intent(q: str) -> str:
     q = q.lower()
-    if any(k in q for k in ["how many", "count", "number of", "statistics"]):
+    if any(k in q for k in ["how many", "count", "number of"]):
         return "analytics"
-    if any(k in q for k in ["advice", "guidance", "counsel", "what should i do"]):
+    if any(k in q for k in ["advice", "guidance", "counsel"]):
         return "advisory"
     return "hybrid"
 
@@ -64,43 +55,18 @@ def classify_intent(q: str) -> str:
 # Text Helpers
 # -------------------------------
 def normalize(text: str) -> str:
-    if not text:
-        return ""
-    text = text.lower()
-    text = re.sub(r'[\"\'“”.,()\-]', '', text)
-    return text.strip()
+    return re.sub(r'[\"\'“”.,()\-]', '', str(text).lower()).strip()
 
-def fuzzy_match(a: str, b: str, threshold=0.72) -> bool:
-    a = normalize(a)
-    b = normalize(b)
-    if not a or not b:
-        return False
-    return (
-        b in a
-        or a in b
-        or SequenceMatcher(None, a, b).ratio() >= threshold
-    )
-
-# -------------------------------
-# Clean user query (quoted input fix)
-# -------------------------------
 def clean_user_query(q: str) -> str:
-    q = q.strip()
-    if (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'")):
-        q = q[1:-1]
-    return q.strip()
+    return q.strip().strip('"').strip("'")
 
 # -------------------------------
-# University Normalization
+# University Canonicalization
 # -------------------------------
 UNIVERSITY_ALIASES = {
-    "ucsd": [
-        "university of california san diego",
-        "uc san diego",
-        "university of california san diego ucsd"
-    ],
-    "mit": ["massachusetts institute of technology"],
     "cornell": ["cornell university"],
+    "ucsd": ["university of california san diego", "uc san diego"],
+    "mit": ["massachusetts institute of technology"],
     "uc berkeley": ["university of california berkeley", "uc berkeley"]
 }
 
@@ -112,56 +78,38 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# ✅ FINAL ADMISSION COLUMN LOGIC (CORRECT)
+# FINAL ADMIT COLUMN LOCK
 # -------------------------------
-ADMIT_INCLUDE_HINTS = [
-    "admit",
-    "admitted",
-    "final",
-    "decision",
-    "result"
-]
-
-ADMIT_EXCLUDE_HINTS = [
-    "applied",
-    "application",
-    "preference",
-    "choice",
-    "list"
-]
+ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision", "result"]
+ADMIT_EXCLUDE_HINTS = ["applied", "application", "preference", "choice", "list"]
 
 def is_admit_column(col_name: str) -> bool:
     col = normalize(col_name)
-
-    # ❌ Never count applied / preference columns
     if any(bad in col for bad in ADMIT_EXCLUDE_HINTS):
         return False
-
-    # ✅ Only explicit admission outcome columns
     return any(good in col for good in ADMIT_INCLUDE_HINTS)
 
 # -------------------------------
-# Row Matching
+# FINAL ADMIT MATCH (CRITICAL FIX)
 # -------------------------------
-def row_contains_value(row: dict, query: str) -> bool:
-    for cell in row.values():
-        if fuzzy_match(str(cell), query):
-            return True
-    return False
+def extract_universities(cell: str):
+    return [
+        normalize_university(p.strip())
+        for p in re.split(r"[;,/|]", normalize(cell))
+        if p.strip()
+    ]
 
-def row_contains_university(row: dict, query: str) -> bool:
-    q_norm = normalize_university(query)
+def row_has_final_admit(row: dict, university: str) -> bool:
+    target = normalize_university(university)
 
-    for col_name, cell in row.items():
-        if not is_admit_column(col_name):
-            continue  # 🔒 prevents "applied to" false positives
+    for col, cell in row.items():
+        if not is_admit_column(col):
+            continue
 
-        cell_text = normalize(str(cell))
+        universities = extract_universities(cell)
 
-        if q_norm in cell_text:
-            return True
-
-        if fuzzy_match(cell_text, q_norm):
+        # ✅ MUST be exactly ONE final admit
+        if len(universities) == 1 and universities[0] == target:
             return True
 
     return False
@@ -175,12 +123,8 @@ def filter_students(records, filters):
     for row in records:
         ok = True
 
-        if "school_name" in filters:
-            if not row_contains_value(row, filters["school_name"]):
-                ok = False
-
-        if ok and "admitted_university" in filters:
-            if not row_contains_university(row, filters["admitted_university"]):
+        if "admitted_university" in filters:
+            if not row_has_final_admit(row, filters["admitted_university"]):
                 ok = False
 
         if ok:
@@ -192,27 +136,9 @@ def filter_students(records, filters):
 # Analytics Response
 # -------------------------------
 def handle_analytics_response(query, students):
-    prompt = f"""
-User question:
-"{query}"
-
-Exact count:
-{len(students)}
-
-Rules:
-- Start with the number
-- One sentence only
-"""
-    resp = client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=60
-    )
-
     return {
         "intent": "analytics",
-        "assistant_answer": resp.choices[0].message.content.strip()
+        "assistant_answer": f"{len(students)} students got into {query.split('into')[-1].strip()}."
     }
 
 # -------------------------------
@@ -231,28 +157,18 @@ async def nl_query(req: ChatRequest):
 
     prompt = f"""
 Convert the user query into JSON.
-
-Allowed keys:
-school_name,
-admitted_university
-
-User query:
-"{user_query}"
+Allowed keys: admitted_university
+User query: "{user_query}"
 """
-    resp = client_llm.chat.completions.create(
+
+    raw = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
-    )
-
-    raw = resp.choices[0].message.content
+    ).choices[0].message.content
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
-
-    for k, v in filters.items():
-        if isinstance(v, str):
-            filters[k] = normalize(v)
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
