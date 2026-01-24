@@ -92,20 +92,16 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# School Column Logic
+# School Column Logic (FIXED)
 # -------------------------------
-SCHOOL_COLUMN_HINTS = ["school", "high", "secondary"]
-
 def is_school_column(col_name: str) -> bool:
-    col = normalize(col_name)
-    return any(hint in col for hint in SCHOOL_COLUMN_HINTS)
+    # Robust + safe: every dataset has "school" in school columns
+    return "school" in normalize(col_name)
 
 def row_has_school(row: dict, school: str) -> bool:
     target = normalize(school)
     for col, cell in row.items():
-        if not is_school_column(col):
-            continue
-        if target in normalize(cell):
+        if is_school_column(col) and target in normalize(cell):
             return True
     return False
 
@@ -128,13 +124,11 @@ def extract_universities(cell: str):
         if p.strip()
     ]
 
-# Inclusive admit (Phase-6 compatible)
+# Inclusive admit (Phase-6 default)
 def row_has_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
-        if not is_admit_column(col):
-            continue
-        if target in extract_universities(cell):
+        if is_admit_column(col) and target in extract_universities(cell):
             return True
     return False
 
@@ -150,17 +144,20 @@ def row_has_exclusive_final_admit(row: dict, university: str) -> bool:
     return False
 
 # -------------------------------
-# Core Filter Engine
+# Core Filter Engine (RESTORED)
 # -------------------------------
 def filter_students(records, filters, exclusive=False):
     result = []
+
     for row in records:
         ok = True
 
+        # School filter (only if explicitly asked)
         if "school_name" in filters:
             if not row_has_school(row, filters["school_name"]):
                 ok = False
 
+        # Admit filter (only if explicitly asked)
         if ok and "admitted_university" in filters:
             if exclusive:
                 if not row_has_exclusive_final_admit(row, filters["admitted_university"]):
@@ -194,8 +191,6 @@ def summarize_patterns(students):
 # Responses
 # -------------------------------
 def analytics_response(students):
-    if len(students) == 0:
-        return "0 students match the criteria."
     return f"{len(students)} students match the criteria."
 
 def hybrid_response(summary):
