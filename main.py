@@ -75,6 +75,22 @@ def clean_user_query(q: str) -> str:
     return q.strip()
 
 # -------------------------------
+# 🔒 Deterministic School Extraction (CRITICAL FIX)
+# -------------------------------
+def extract_school_from_query(q: str):
+    """
+    Extracts school name from:
+    'students from Greenwood High'
+    """
+    match = re.search(
+        r"from\s+([a-zA-Z\s]+?)(?:\?|$|got|are|who|in the database)",
+        q.lower()
+    )
+    if match:
+        return match.group(1).strip().title()
+    return None
+
+# -------------------------------
 # University Canonicalization
 # -------------------------------
 UNIVERSITY_ALIASES = {
@@ -92,10 +108,9 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# School Column Logic (FIXED)
+# School Column Logic
 # -------------------------------
 def is_school_column(col_name: str) -> bool:
-    # Robust + safe: every dataset has "school" in school columns
     return "school" in normalize(col_name)
 
 def row_has_school(row: dict, school: str) -> bool:
@@ -124,7 +139,6 @@ def extract_universities(cell: str):
         if p.strip()
     ]
 
-# Inclusive admit (Phase-6 default)
 def row_has_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
@@ -132,19 +146,17 @@ def row_has_admit(row: dict, university: str) -> bool:
             return True
     return False
 
-# Exclusive admit (Phase-7 strict)
 def row_has_exclusive_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
-        if not is_admit_column(col):
-            continue
-        universities = extract_universities(cell)
-        if len(universities) == 1 and universities[0] == target:
-            return True
+        if is_admit_column(col):
+            u = extract_universities(cell)
+            if len(u) == 1 and u[0] == target:
+                return True
     return False
 
 # -------------------------------
-# Core Filter Engine (RESTORED)
+# Core Filter Engine
 # -------------------------------
 def filter_students(records, filters, exclusive=False):
     result = []
@@ -152,12 +164,10 @@ def filter_students(records, filters, exclusive=False):
     for row in records:
         ok = True
 
-        # School filter (only if explicitly asked)
         if "school_name" in filters:
             if not row_has_school(row, filters["school_name"]):
                 ok = False
 
-        # Admit filter (only if explicitly asked)
         if ok and "admitted_university" in filters:
             if exclusive:
                 if not row_has_exclusive_final_admit(row, filters["admitted_university"]):
@@ -226,16 +236,21 @@ async def nl_query(req: ChatRequest):
             "assistant_answer": "Advisory flow unchanged."
         }
 
+    # 🔒 Deterministic school extraction FIRST
+    filters = {}
+    school = extract_school_from_query(user_query)
+    if school:
+        filters["school_name"] = school
+
+    # LLM only for university
     prompt = f"""
 Convert the user query into JSON.
 Allowed keys:
-school_name,
 admitted_university
 
 User query:
 "{user_query}"
 """
-
     raw = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -243,7 +258,8 @@ User query:
     ).choices[0].message.content
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
-    filters = json.loads(match.group()) if match else {}
+    llm_filters = json.loads(match.group()) if match else {}
+    filters.update(llm_filters)
 
     records = sheet.get_all_records()
     students = filter_students(records, filters, exclusive=exclusive)
