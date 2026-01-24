@@ -58,6 +58,10 @@ def classify_mode(q: str) -> str:
         return "hybrid"
     return "analytics"
 
+def is_exclusive_admit(q: str) -> bool:
+    q = q.lower()
+    return any(k in q for k in ["only", "sole", "final choice", "chose", "exclusively"])
+
 # -------------------------------
 # Text Helpers
 # -------------------------------
@@ -106,7 +110,7 @@ def row_has_school(row: dict, school: str) -> bool:
     return False
 
 # -------------------------------
-# FINAL ADMIT COLUMN LOCK
+# Admit Column Logic
 # -------------------------------
 ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision", "result"]
 ADMIT_EXCLUDE_HINTS = ["applied", "application", "preference", "choice", "list"]
@@ -124,7 +128,18 @@ def extract_universities(cell: str):
         if p.strip()
     ]
 
-def row_has_final_admit(row: dict, university: str) -> bool:
+# Inclusive admit (Phase-6 compatible)
+def row_has_admit(row: dict, university: str) -> bool:
+    target = normalize_university(university)
+    for col, cell in row.items():
+        if not is_admit_column(col):
+            continue
+        if target in extract_universities(cell):
+            return True
+    return False
+
+# Exclusive admit (Phase-7 strict)
+def row_has_exclusive_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
         if not is_admit_column(col):
@@ -137,7 +152,7 @@ def row_has_final_admit(row: dict, university: str) -> bool:
 # -------------------------------
 # Core Filter Engine
 # -------------------------------
-def filter_students(records, filters):
+def filter_students(records, filters, exclusive=False):
     result = []
     for row in records:
         ok = True
@@ -147,8 +162,12 @@ def filter_students(records, filters):
                 ok = False
 
         if ok and "admitted_university" in filters:
-            if not row_has_final_admit(row, filters["admitted_university"]):
-                ok = False
+            if exclusive:
+                if not row_has_exclusive_final_admit(row, filters["admitted_university"]):
+                    ok = False
+            else:
+                if not row_has_admit(row, filters["admitted_university"]):
+                    ok = False
 
         if ok:
             result.append(row)
@@ -176,7 +195,7 @@ def summarize_patterns(students):
 # -------------------------------
 def analytics_response(students):
     if len(students) == 0:
-        return "0 students match the criteria. No final admits are recorded for this combination in the database."
+        return "0 students match the criteria."
     return f"{len(students)} students match the criteria."
 
 def hybrid_response(summary):
@@ -189,10 +208,7 @@ Rules:
 - No numbers
 - No guarantees
 - Use cautious language like "tend to", "typically"
-
-Generate a short explanatory insight.
 """
-
     return client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -207,6 +223,7 @@ async def nl_query(req: ChatRequest):
     user_query = clean_user_query(req.message)
     intent = classify_intent(user_query)
     mode = classify_mode(user_query)
+    exclusive = is_exclusive_admit(user_query)
 
     if intent == "advisory":
         return {
@@ -234,11 +251,10 @@ User query:
     filters = json.loads(match.group()) if match else {}
 
     records = sheet.get_all_records()
-    students = filter_students(records, filters)
+    students = filter_students(records, filters, exclusive=exclusive)
 
     if mode == "hybrid":
-        summary = summarize_patterns(students)
-        answer = hybrid_response(summary)
+        answer = hybrid_response(summarize_patterns(students))
     else:
         answer = analytics_response(students)
 
