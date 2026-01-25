@@ -90,11 +90,14 @@ def is_school_column(col_name: str) -> bool:
     col = normalize(col_name)
     return any(hint in col for hint in SCHOOL_COLUMN_HINTS)
 
+# ✅ FIX: bidirectional school match
 def row_has_school(row: dict, school: str) -> bool:
     target = normalize(school)
     for col, cell in row.items():
-        if is_school_column(col) and target in normalize(cell):
-            return True
+        if is_school_column(col):
+            cell_norm = normalize(cell)
+            if target in cell_norm or cell_norm in target:
+                return True
     return False
 
 # -------------------------------
@@ -116,12 +119,13 @@ def extract_universities(cell: str):
         if p.strip()
     ]
 
-# ✅ FIX: inclusive admit match (Phase-6 behavior)
+# ✅ FIX: inclusive admit matching (set-based, robust)
 def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
         if is_admit_column(col):
-            if target in extract_universities(cell):
+            admitted = {normalize_university(u) for u in extract_universities(cell)}
+            if target in admitted:
                 return True
     return False
 
