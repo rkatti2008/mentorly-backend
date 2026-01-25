@@ -81,7 +81,7 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# School Column Logic (NEW FIX)
+# School Column Logic
 # -------------------------------
 SCHOOL_COLUMN_HINTS = ["school", "high", "secondary"]
 
@@ -92,14 +92,12 @@ def is_school_column(col_name: str) -> bool:
 def row_has_school(row: dict, school: str) -> bool:
     target = normalize(school)
     for col, cell in row.items():
-        if not is_school_column(col):
-            continue
-        if target in normalize(cell):
+        if is_school_column(col) and target in normalize(cell):
             return True
     return False
 
 # -------------------------------
-# FINAL ADMIT COLUMN LOCK
+# Admit Column Logic
 # -------------------------------
 ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision", "result"]
 ADMIT_EXCLUDE_HINTS = ["applied", "application", "preference", "choice", "list"]
@@ -110,9 +108,6 @@ def is_admit_column(col_name: str) -> bool:
         return False
     return any(good in col for good in ADMIT_INCLUDE_HINTS)
 
-# -------------------------------
-# FINAL ADMIT MATCH (STRICT)
-# -------------------------------
 def extract_universities(cell: str):
     return [
         normalize_university(p.strip())
@@ -122,21 +117,15 @@ def extract_universities(cell: str):
 
 def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
-
     for col, cell in row.items():
-        if not is_admit_column(col):
-            continue
-
-        universities = extract_universities(cell)
-
-        # EXACTLY one final admit, and it must match
-        if len(universities) == 1 and universities[0] == target:
-            return True
-
+        if is_admit_column(col):
+            universities = extract_universities(cell)
+            if len(universities) == 1 and universities[0] == target:
+                return True
     return False
 
 # -------------------------------
-# Core Filter Engine (FINAL)
+# Core Filter Engine (FIXED)
 # -------------------------------
 def filter_students(records, filters):
     result = []
@@ -144,12 +133,16 @@ def filter_students(records, filters):
     for row in records:
         ok = True
 
-        if "school_name" in filters:
-            if not row_has_school(row, filters["school_name"]):
+        # Apply school filter ONLY if non-empty
+        school = filters.get("school_name")
+        if school and school.strip():
+            if not row_has_school(row, school):
                 ok = False
 
-        if ok and "admitted_university" in filters:
-            if not row_has_final_admit(row, filters["admitted_university"]):
+        # Apply admit filter ONLY if non-empty
+        admit = filters.get("admitted_university")
+        if ok and admit and admit.strip():
+            if not row_has_final_admit(row, admit):
                 ok = False
 
         if ok:
@@ -198,7 +191,6 @@ User query:
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
-    
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
