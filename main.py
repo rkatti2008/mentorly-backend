@@ -99,7 +99,7 @@ def row_has_school(row: dict, school: str) -> bool:
 # -------------------------------
 # Admit Column Logic
 # -------------------------------
-ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision", "result"]
+ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision","accept", "accepted", "result"]
 ADMIT_EXCLUDE_HINTS = ["applied", "application", "preference", "choice", "list"]
 
 def is_admit_column(col_name: str) -> bool:
