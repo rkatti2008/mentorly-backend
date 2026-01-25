@@ -95,7 +95,6 @@ def row_has_school(row: dict, school: str) -> bool:
     for col, cell in row.items():
         if is_school_column(col):
             cell_norm = normalize(cell)
-            # bidirectional match
             if target in cell_norm or cell_norm in target:
                 return True
     return False
@@ -134,15 +133,29 @@ def row_has_final_admit(row: dict, university: str) -> bool:
 def filter_students(records, filters):
     result = []
 
+    # Map any possible LLM keys to internal keys
+    key_map = {
+        "school": "school_name",
+        "school_name": "school_name",
+        "admitted": "admitted_university",
+        "admitted_univs": "admitted_university",
+        "admitted_university": "admitted_university"
+    }
+    mapped_filters = {}
+    for k, v in filters.items():
+        k_norm = normalize(k).replace(" ", "_")
+        if k_norm in key_map:
+            mapped_filters[key_map[k_norm]] = v
+
     for row in records:
         ok = True
 
-        school = filters.get("school_name")
+        school = mapped_filters.get("school_name")
         if school and school.strip():
             if not row_has_school(row, school):
                 ok = False
 
-        admit = filters.get("admitted_university")
+        admit = mapped_filters.get("admitted_university")
         if ok and admit and admit.strip():
             if not row_has_final_admit(row, admit):
                 ok = False
@@ -175,7 +188,7 @@ async def nl_query(req: ChatRequest):
             "assistant_answer": "Advisory flow unchanged."
         }
 
-    # ✅ NEW: dynamically allow all sheet columns as keys
+    # Dynamically allow all sheet columns as keys
     all_columns = sheet.row_values(1)  # first row = headers
     normalized_columns = [normalize(col).replace(" ", "_") for col in all_columns]
 
