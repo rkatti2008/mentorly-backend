@@ -99,7 +99,7 @@ def row_has_school(row: dict, school: str) -> bool:
 # -------------------------------
 # Admit Column Logic
 # -------------------------------
-ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision","accept", "accepted", "result"]
+ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision", "accept", "accepted", "result"]
 ADMIT_EXCLUDE_HINTS = ["applied", "application", "preference", "choice", "list"]
 
 def is_admit_column(col_name: str) -> bool:
@@ -115,17 +115,17 @@ def extract_universities(cell: str):
         if p.strip()
     ]
 
+# ✅ FIX: inclusive admit match (Phase-6 behavior)
 def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
         if is_admit_column(col):
-            universities = extract_universities(cell)
-            if len(universities) == 1 and universities[0] == target:
+            if target in extract_universities(cell):
                 return True
     return False
 
 # -------------------------------
-# Core Filter Engine (FIXED)
+# Core Filter Engine
 # -------------------------------
 def filter_students(records, filters):
     result = []
@@ -133,13 +133,11 @@ def filter_students(records, filters):
     for row in records:
         ok = True
 
-        # Apply school filter ONLY if non-empty
         school = filters.get("school_name")
         if school and school.strip():
             if not row_has_school(row, school):
                 ok = False
 
-        # Apply admit filter ONLY if non-empty
         admit = filters.get("admitted_university")
         if ok and admit and admit.strip():
             if not row_has_final_admit(row, admit):
