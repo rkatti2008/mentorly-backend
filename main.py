@@ -5,7 +5,6 @@ from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
 import os, json, re
-from collections import Counter
 
 app = FastAPI()
 
@@ -42,7 +41,7 @@ class ChatRequest(BaseModel):
     message: str
 
 # -------------------------------
-# Intent + Mode Classification
+# Intent Classification
 # -------------------------------
 def classify_intent(q: str) -> str:
     q = q.lower()
@@ -51,15 +50,6 @@ def classify_intent(q: str) -> str:
     if any(k in q for k in ["advice", "guidance", "counsel"]):
         return "advisory"
     return "hybrid"
-
-def classify_mode(q: str) -> str:
-    q = q.lower()
-    if any(k in q for k in ["why", "how do", "is it possible", "chances", "realistic"]):
-        return "hybrid"
-    return "analytics"
-
-def is_exclusive_admit(q: str) -> bool:
-    return any(k in q.lower() for k in ["only", "sole", "final choice", "chose", "exclusively"])
 
 # -------------------------------
 # Text Helpers
@@ -72,22 +62,6 @@ def clean_user_query(q: str) -> str:
     if (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'")):
         q = q[1:-1]
     return q.strip()
-
-# -------------------------------
-# 🔒 Deterministic School Extraction (FIXED)
-# -------------------------------
-def extract_school_from_query(q: str):
-    """
-    Extracts school name WITHOUT altering casing or words.
-    """
-    match = re.search(
-        r"from\s+(.+?)(?:\?|$|got|are|who|in the database)",
-        q,
-        re.IGNORECASE
-    )
-    if match:
-        return match.group(1).strip()
-    return None
 
 # -------------------------------
 # University Canonicalization
@@ -107,20 +81,25 @@ def normalize_university(val: str) -> str:
     return val
 
 # -------------------------------
-# School Column Logic
+# School Column Logic (NEW FIX)
 # -------------------------------
+SCHOOL_COLUMN_HINTS = ["school", "high", "secondary"]
+
 def is_school_column(col_name: str) -> bool:
-    return "school" in normalize(col_name)
+    col = normalize(col_name)
+    return any(hint in col for hint in SCHOOL_COLUMN_HINTS)
 
 def row_has_school(row: dict, school: str) -> bool:
     target = normalize(school)
     for col, cell in row.items():
-        if is_school_column(col) and target in normalize(cell):
+        if not is_school_column(col):
+            continue
+        if target in normalize(cell):
             return True
     return False
 
 # -------------------------------
-# Admit Column Logic
+# FINAL ADMIT COLUMN LOCK
 # -------------------------------
 ADMIT_INCLUDE_HINTS = ["final", "admit", "admitted", "decision", "result"]
 ADMIT_EXCLUDE_HINTS = ["applied", "application", "preference", "choice", "list"]
@@ -131,6 +110,9 @@ def is_admit_column(col_name: str) -> bool:
         return False
     return any(good in col for good in ADMIT_INCLUDE_HINTS)
 
+# -------------------------------
+# FINAL ADMIT MATCH (STRICT)
+# -------------------------------
 def extract_universities(cell: str):
     return [
         normalize_university(p.strip())
@@ -138,26 +120,25 @@ def extract_universities(cell: str):
         if p.strip()
     ]
 
-def row_has_admit(row: dict, university: str) -> bool:
+def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
+
     for col, cell in row.items():
-        if is_admit_column(col) and target in extract_universities(cell):
+        if not is_admit_column(col):
+            continue
+
+        universities = extract_universities(cell)
+
+        # EXACTLY one final admit, and it must match
+        if len(universities) == 1 and universities[0] == target:
             return True
-    return False
 
-def row_has_exclusive_final_admit(row: dict, university: str) -> bool:
-    target = normalize_university(university)
-    for col, cell in row.items():
-        if is_admit_column(col):
-            u = extract_universities(cell)
-            if len(u) == 1 and u[0] == target:
-                return True
     return False
 
 # -------------------------------
-# Core Filter Engine
+# Core Filter Engine (FINAL)
 # -------------------------------
-def filter_students(records, filters, exclusive=False):
+def filter_students(records, filters):
     result = []
 
     for row in records:
@@ -168,12 +149,8 @@ def filter_students(records, filters, exclusive=False):
                 ok = False
 
         if ok and "admitted_university" in filters:
-            if exclusive:
-                if not row_has_exclusive_final_admit(row, filters["admitted_university"]):
-                    ok = False
-            else:
-                if not row_has_admit(row, filters["admitted_university"]):
-                    ok = False
+            if not row_has_final_admit(row, filters["admitted_university"]):
+                ok = False
 
         if ok:
             result.append(row)
@@ -181,43 +158,13 @@ def filter_students(records, filters, exclusive=False):
     return result
 
 # -------------------------------
-# Phase 7: Explainable Summaries
+# Analytics Response
 # -------------------------------
-def summarize_patterns(students):
-    boards = Counter()
-    schools = Counter()
-
-    for s in students:
-        boards[s.get("12th Board", "Unknown")] += 1
-        schools[s.get("School", "Unknown")] += 1
-
+def handle_analytics_response(query, students):
     return {
-        "top_boards": [b for b, _ in boards.most_common(2)],
-        "top_schools": [s for s, _ in schools.most_common(2)]
+        "intent": "analytics",
+        "assistant_answer": f"{len(students)} students match the criteria."
     }
-
-# -------------------------------
-# Responses
-# -------------------------------
-def analytics_response(students):
-    return f"{len(students)} students match the criteria."
-
-def hybrid_response(summary):
-    prompt = f"""
-Facts (do not invent anything):
-- Boards seen: {summary['top_boards']}
-- Schools seen: {summary['top_schools']}
-
-Rules:
-- No numbers
-- No guarantees
-- Use cautious language like "tend to", "typically"
-"""
-    return client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    ).choices[0].message.content.strip()
 
 # -------------------------------
 # API
@@ -226,8 +173,6 @@ Rules:
 async def nl_query(req: ChatRequest):
     user_query = clean_user_query(req.message)
     intent = classify_intent(user_query)
-    mode = classify_mode(user_query)
-    exclusive = is_exclusive_admit(user_query)
 
     if intent == "advisory":
         return {
@@ -235,21 +180,16 @@ async def nl_query(req: ChatRequest):
             "assistant_answer": "Advisory flow unchanged."
         }
 
-    # Deterministic school extraction
-    filters = {}
-    school = extract_school_from_query(user_query)
-    if school:
-        filters["school_name"] = school
-
-    # LLM only for university
     prompt = f"""
 Convert the user query into JSON.
 Allowed keys:
+school_name,
 admitted_university
 
 User query:
 "{user_query}"
 """
+
     raw = client_llm.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -257,19 +197,9 @@ User query:
     ).choices[0].message.content
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        filters.update(json.loads(match.group()))
+    filters = json.loads(match.group()) if match else {}
 
     records = sheet.get_all_records()
-    students = filter_students(records, filters, exclusive=exclusive)
+    students = filter_students(records, filters)
 
-    answer = (
-        hybrid_response(summarize_patterns(students))
-        if mode == "hybrid"
-        else analytics_response(students)
-    )
-
-    return {
-        "intent": intent,
-        "assistant_answer": answer
-    }
+    return handle_analytics_response(user_query, students)
