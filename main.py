@@ -59,8 +59,7 @@ def classify_mode(q: str) -> str:
     return "analytics"
 
 def is_exclusive_admit(q: str) -> bool:
-    q = q.lower()
-    return any(k in q for k in ["only", "sole", "final choice", "chose", "exclusively"])
+    return any(k in q.lower() for k in ["only", "sole", "final choice", "chose", "exclusively"])
 
 # -------------------------------
 # Text Helpers
@@ -75,19 +74,19 @@ def clean_user_query(q: str) -> str:
     return q.strip()
 
 # -------------------------------
-# 🔒 Deterministic School Extraction (CRITICAL FIX)
+# 🔒 Deterministic School Extraction (FIXED)
 # -------------------------------
 def extract_school_from_query(q: str):
     """
-    Extracts school name from:
-    'students from Greenwood High'
+    Extracts school name WITHOUT altering casing or words.
     """
     match = re.search(
-        r"from\s+([a-zA-Z\s]+?)(?:\?|$|got|are|who|in the database)",
-        q.lower()
+        r"from\s+(.+?)(?:\?|$|got|are|who|in the database)",
+        q,
+        re.IGNORECASE
     )
     if match:
-        return match.group(1).strip().title()
+        return match.group(1).strip()
     return None
 
 # -------------------------------
@@ -236,7 +235,7 @@ async def nl_query(req: ChatRequest):
             "assistant_answer": "Advisory flow unchanged."
         }
 
-    # 🔒 Deterministic school extraction FIRST
+    # Deterministic school extraction
     filters = {}
     school = extract_school_from_query(user_query)
     if school:
@@ -258,16 +257,17 @@ User query:
     ).choices[0].message.content
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
-    llm_filters = json.loads(match.group()) if match else {}
-    filters.update(llm_filters)
+    if match:
+        filters.update(json.loads(match.group()))
 
     records = sheet.get_all_records()
     students = filter_students(records, filters, exclusive=exclusive)
 
-    if mode == "hybrid":
-        answer = hybrid_response(summarize_patterns(students))
-    else:
-        answer = analytics_response(students)
+    answer = (
+        hybrid_response(summarize_patterns(students))
+        if mode == "hybrid"
+        else analytics_response(students)
+    )
 
     return {
         "intent": intent,
