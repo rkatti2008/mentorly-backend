@@ -95,7 +95,7 @@ def row_has_school(row: dict, school: str) -> bool:
     for col, cell in row.items():
         if is_school_column(col):
             cell_norm = normalize(cell)
-            # ✅ bidirectional match
+            # bidirectional match
             if target in cell_norm or cell_norm in target:
                 return True
     return False
@@ -112,7 +112,6 @@ def is_admit_column(col_name: str) -> bool:
         return False
     return any(good in col for good in ADMIT_INCLUDE_HINTS)
 
-# ✅ FIX: Split first, then normalize each university
 def extract_universities(cell: str):
     return [
         normalize_university(u.strip())
@@ -120,7 +119,6 @@ def extract_universities(cell: str):
         if u.strip()
     ]
 
-# ✅ FIX: inclusive admit matching (supports multiple universities in a cell)
 def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
@@ -177,11 +175,14 @@ async def nl_query(req: ChatRequest):
             "assistant_answer": "Advisory flow unchanged."
         }
 
+    # ✅ NEW: dynamically allow all sheet columns as keys
+    all_columns = sheet.row_values(1)  # first row = headers
+    normalized_columns = [normalize(col).replace(" ", "_") for col in all_columns]
+
     prompt = f"""
 Convert the user query into JSON.
 Allowed keys:
-school_name,
-admitted_university
+{', '.join(normalized_columns)}
 
 User query:
 "{user_query}"
