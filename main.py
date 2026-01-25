@@ -198,6 +198,7 @@ User query:
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
+    
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
