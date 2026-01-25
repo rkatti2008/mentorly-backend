@@ -95,6 +95,7 @@ def row_has_school(row: dict, school: str) -> bool:
     for col, cell in row.items():
         if is_school_column(col):
             cell_norm = normalize(cell)
+            # ✅ bidirectional match
             if target in cell_norm or cell_norm in target:
                 return True
     return False
@@ -114,18 +115,18 @@ def is_admit_column(col_name: str) -> bool:
 # ✅ FIX: Split first, then normalize each university
 def extract_universities(cell: str):
     return [
-        normalize_university(p.strip())
-        for p in re.split(r"[;,/|]", str(cell))
-        if p.strip()
+        normalize_university(u.strip())
+        for u in re.split(r"[;,/|]", str(cell))
+        if u.strip()
     ]
 
-# ✅ FIX: inclusive admit matching (works with multiple universities in a cell)
+# ✅ FIX: inclusive admit matching (supports multiple universities in a cell)
 def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
         if is_admit_column(col):
-            admitted = {normalize_university(u) for u in extract_universities(cell)}
-            if target in admitted:
+            admitted_set = set(extract_universities(cell))
+            if target in admitted_set:
                 return True
     return False
 
