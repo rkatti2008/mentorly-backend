@@ -131,7 +131,6 @@ def row_has_final_admit(row: dict, university: str) -> bool:
 def filter_students(records, filters):
     result = []
 
-    # Map any possible LLM keys to internal keys
     key_map = {
         "school": "school_name",
         "school_name": "school_name",
@@ -187,7 +186,6 @@ async def nl_query(req: ChatRequest):
             "assistant_answer": "Advisory flow unchanged."
         }
 
-    # Dynamically allow all sheet columns as keys
     all_columns = sheet.row_values(1)
     normalized_columns = [normalize(col).replace(" ", "_") for col in all_columns]
 
@@ -209,7 +207,7 @@ User query:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
 
-    # ✅ FALLBACK ADMIT EXTRACTION (CRITICAL FIX)
+    # ✅ FALLBACK ADMIT EXTRACTION
     if (
         intent == "analytics"
         and not any("admit" in normalize(k) for k in filters.keys())
@@ -223,6 +221,16 @@ User query:
                 if normalize(a) in normalize(user_query):
                     filters["admitted_university"] = canon
                     break
+
+    # ✅ FALLBACK SCHOOL EXTRACTION (NEW FIX)
+    if (
+        intent == "analytics"
+        and not any("school" in normalize(k) for k in filters.keys())
+        and "school" in normalize(user_query)
+    ):
+        match = re.search(r"from\s+(.+?school)", user_query, re.IGNORECASE)
+        if match:
+            filters["school_name"] = match.group(1).strip()
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
