@@ -207,10 +207,27 @@ User query:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
 
+    # -------------------------------
+    # Build mapped filters (for fallback decisions)
+    # -------------------------------
+    key_map = {
+        "school": "school_name",
+        "school_name": "school_name",
+        "admitted": "admitted_university",
+        "admitted_univs": "admitted_university",
+        "admitted_university": "admitted_university"
+    }
+
+    mapped_filters = {}
+    for k, v in filters.items():
+        k_norm = normalize(k).replace(" ", "_")
+        if k_norm in key_map:
+            mapped_filters[key_map[k_norm]] = v
+
     # ✅ FALLBACK ADMIT EXTRACTION
     if (
         intent == "analytics"
-        and not any("admit" in normalize(k) for k in filters.keys())
+        and "admitted_university" not in mapped_filters
         and re.search(r"\b(admit|admitted|accepted|got into|get into)\b", user_query.lower())
     ):
         for canon, aliases in UNIVERSITY_ALIASES.items():
@@ -222,11 +239,11 @@ User query:
                     filters["admitted_university"] = canon
                     break
 
-    # ✅ FALLBACK SCHOOL EXTRACTION (NEW FIX)
+    # ✅ FALLBACK SCHOOL EXTRACTION (FIXED)
     if (
         intent == "analytics"
-        and not any("school" in normalize(k) for k in filters.keys())
-        and "school" in normalize(user_query)
+        and "school_name" not in mapped_filters
+        and re.search(r"\bschool\b", user_query.lower())
     ):
         match = re.search(r"from\s+(.+?school)", user_query, re.IGNORECASE)
         if match:
