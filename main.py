@@ -8,7 +8,6 @@ import os, json, re
 
 app = FastAPI()
 
-
 # -------------------------------
 # CORS
 # -------------------------------
@@ -122,8 +121,7 @@ def row_has_final_admit(row: dict, university: str) -> bool:
     target = normalize_university(university)
     for col, cell in row.items():
         if is_admit_column(col):
-            admitted_set = set(extract_universities(cell))
-            if target in admitted_set:
+            if target in set(extract_universities(cell)):
                 return True
     return False
 
@@ -141,6 +139,7 @@ def filter_students(records, filters):
         "admitted_univs": "admitted_university",
         "admitted_university": "admitted_university"
     }
+
     mapped_filters = {}
     for k, v in filters.items():
         k_norm = normalize(k).replace(" ", "_")
@@ -151,12 +150,12 @@ def filter_students(records, filters):
         ok = True
 
         school = mapped_filters.get("school_name")
-        if school and school.strip():
+        if school:
             if not row_has_school(row, school):
                 ok = False
 
         admit = mapped_filters.get("admitted_university")
-        if ok and admit and admit.strip():
+        if ok and admit:
             if not row_has_final_admit(row, admit):
                 ok = False
 
@@ -189,7 +188,7 @@ async def nl_query(req: ChatRequest):
         }
 
     # Dynamically allow all sheet columns as keys
-    all_columns = sheet.row_values(1)  # first row = headers
+    all_columns = sheet.row_values(1)
     normalized_columns = [normalize(col).replace(" ", "_") for col in all_columns]
 
     prompt = f"""
@@ -209,6 +208,21 @@ User query:
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
+
+    # ✅ FALLBACK ADMIT EXTRACTION (CRITICAL FIX)
+    if (
+        intent == "analytics"
+        and not any("admit" in normalize(k) for k in filters.keys())
+        and re.search(r"\b(admit|admitted|accepted|got into|get into)\b", user_query.lower())
+    ):
+        for canon, aliases in UNIVERSITY_ALIASES.items():
+            if canon in normalize(user_query):
+                filters["admitted_university"] = canon
+                break
+            for a in aliases:
+                if normalize(a) in normalize(user_query):
+                    filters["admitted_university"] = canon
+                    break
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
