@@ -126,7 +126,7 @@ def row_has_final_admit(row: dict, university: str) -> bool:
     return False
 
 # -------------------------------
-# Core Filter Engine
+# Core Filter Engine (UNCHANGED)
 # -------------------------------
 def filter_students(records, filters):
     result = []
@@ -163,13 +163,79 @@ def filter_students(records, filters):
 
     return result
 
-# -------------------------------
-# Analytics Response
-# -------------------------------
+# =========================================================
+# PHASE-6.3 HELPERS (NEW — SAFE ADDITIONS)
+# =========================================================
+
+def extract_school_name(row):
+    for col, val in row.items():
+        if is_school_column(col) and val:
+            return val
+    return "Unknown School"
+
+def extract_major(row):
+    for col, val in row.items():
+        if "major" in normalize(col) and val:
+            return val
+    return "Undeclared"
+
+def extract_free_advice(row):
+    for col, val in row.items():
+        if "free" in normalize(col) and "advice" in normalize(col):
+            if val and str(val).strip().lower() not in ["na", "n/a"]:
+                return str(val).strip()
+    return None
+
+# =========================================================
+# PHASE-6.3 ANALYTICS RESPONSE (UPGRADED)
+# =========================================================
+
 def handle_analytics_response(query, students):
+    count = len(students)
+
+    if count == 0:
+        return {
+            "intent": "analytics",
+            "assistant_answer": "No matching students were found for this query."
+        }
+
+    intro = (
+        f"There was {count} student who matches your query."
+        if count == 1
+        else f"There were {count} students who match your query."
+    )
+
+    outcomes = []
+    advice_set = []
+
+    for row in students:
+        school = extract_school_name(row)
+        major = extract_major(row)
+
+        admitted_univs = []
+        for col, cell in row.items():
+            if is_admit_column(col):
+                admitted_univs.extend(extract_universities(cell))
+
+        admitted_text = ", ".join(set(admitted_univs)) if admitted_univs else "University not specified"
+
+        outcomes.append(f"• {school} — {major} — Admitted to {admitted_text}")
+
+        advice = extract_free_advice(row)
+        if advice and advice not in advice_set:
+            advice_set.append(advice)
+
+    response = intro + "\n\n"
+    response += "Student Outcomes:\n" + "\n".join(outcomes)
+
+    if advice_set:
+        response += "\n\nAdvice From These Students:\n"
+        for adv in advice_set[:5]:
+            response += f"• {adv}\n"
+
     return {
         "intent": "analytics",
-        "assistant_answer": f"{len(students)} students match the criteria."
+        "assistant_answer": response.strip()
     }
 
 # -------------------------------
@@ -208,7 +274,7 @@ User query:
     filters = json.loads(match.group()) if match else {}
 
     # -------------------------------
-    # Build mapped filters (for fallback decisions)
+    # Build mapped filters
     # -------------------------------
     key_map = {
         "school": "school_name",
@@ -224,7 +290,7 @@ User query:
         if k_norm in key_map:
             mapped_filters[key_map[k_norm]] = v
 
-    # ✅ FALLBACK ADMIT EXTRACTION
+    # Fallback admit extraction
     if (
         intent == "analytics"
         and "admitted_university" not in mapped_filters
@@ -239,7 +305,7 @@ User query:
                     filters["admitted_university"] = canon
                     break
 
-    # ✅ FALLBACK SCHOOL EXTRACTION (FIXED)
+    # Fallback school extraction
     if (
         intent == "analytics"
         and "school_name" not in mapped_filters
