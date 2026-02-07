@@ -149,14 +149,12 @@ def filter_students(records, filters):
         ok = True
 
         school = mapped_filters.get("school_name")
-        if school:
-            if not row_has_school(row, school):
-                ok = False
+        if school and not row_has_school(row, school):
+            ok = False
 
         admit = mapped_filters.get("admitted_university")
-        if ok and admit:
-            if not row_has_final_admit(row, admit):
-                ok = False
+        if ok and admit and not row_has_final_admit(row, admit):
+            ok = False
 
         if ok:
             result.append(row)
@@ -164,9 +162,8 @@ def filter_students(records, filters):
     return result
 
 # =========================================================
-# PHASE-6.3 HELPERS (NEW — SAFE ADDITIONS)
+# PHASE-6.3 HELPERS
 # =========================================================
-
 def extract_school_name(row):
     for col, val in row.items():
         if is_school_column(col) and val:
@@ -187,9 +184,8 @@ def extract_free_advice(row):
     return None
 
 # =========================================================
-# PHASE-6.3 BASE ANALYTICS RESPONSE (DETERMINISTIC)
+# PHASE-6.3 BASE ANALYTICS RESPONSE (FIXED)
 # =========================================================
-
 def handle_analytics_response(query, students):
     count = len(students)
 
@@ -200,13 +196,12 @@ def handle_analytics_response(query, students):
         }
 
     intro = (
-        f"There was {count} student who matches your query."
+        f"There is {count} student who matches your query."
         if count == 1
-        else f"There were {count} students who match your query."
+        else f"There are {count} students who match your query."
     )
 
-    outcomes = []
-    advice_set = []
+    lines = []
 
     for row in students:
         school = extract_school_name(row)
@@ -218,20 +213,20 @@ def handle_analytics_response(query, students):
                 admitted_univs.extend(extract_universities(cell))
 
         admitted_text = ", ".join(set(admitted_univs)) if admitted_univs else "University not specified"
-
-        outcomes.append(f"• {school} — {major} — Admitted to {admitted_text}")
-
         advice = extract_free_advice(row)
-        if advice and advice not in advice_set:
-            advice_set.append(advice)
 
-    response = intro + "\n\n"
-    response += "Student Outcomes:\n" + "\n".join(outcomes)
+        entry = (
+            f"School: {school}\n"
+            f"Intended Major: {major}\n"
+            f"Admitted University: {admitted_text}"
+        )
 
-    if advice_set:
-        response += "\n\nAdvice From These Students:\n"
-        for adv in advice_set[:5]:
-            response += f"• {adv}\n"
+        if advice:
+            entry += f"\nAdvice: {advice}"
+
+        lines.append(entry)
+
+    response = intro + "\n\n" + "\n\n".join(lines)
 
     return {
         "intent": "analytics",
@@ -239,9 +234,8 @@ def handle_analytics_response(query, students):
     }
 
 # =========================================================
-# PHASE-6.3 LLM NLG LAYER (SAFE + OPTIONAL)
+# PHASE-6.3 LLM NLG LAYER (FIXED)
 # =========================================================
-
 def generate_nlg_response(user_query, students, base_response):
     try:
         count = len(students)
@@ -256,11 +250,11 @@ def generate_nlg_response(user_query, students, base_response):
                 if is_admit_column(col):
                     admitted.extend(extract_universities(cell))
 
-            advice = extract_free_advice(row) or "No specific advice provided."
+            advice = extract_free_advice(row) or "No advice provided."
 
             student_blocks.append(
                 f"""
-Student {i}:
+Student {i}
 School: {school}
 Intended Major: {major}
 Admitted Universities: {", ".join(set(admitted)) if admitted else "Not specified"}
@@ -271,13 +265,13 @@ Advice: {advice}
         prompt = f"""
 You are an education counselor assistant.
 
-Write a clear, helpful response based ONLY on the information below.
+Write a clear response using ONLY the information below.
 
 Rules:
 - Do not add facts
-- Do not speculate
-- Use professional, simple English
-- Audience: Grade 11–12 students
+- Do not summarize or rewrite advice
+- Copy advice text verbatim
+- Use plain English (no markdown, no bullets)
 
 User Question:
 "{user_query}"
@@ -288,10 +282,9 @@ Student Details:
 {chr(10).join(student_blocks)}
 
 Instructions:
-1. State the total count first
-2. Mention schools, majors, and admissions
-3. Summarize advice into actionable guidance
-4. Do not mention databases or records
+1. State the total count
+2. List each student with school, major, admission
+3. Include full advice text exactly as provided
 """
 
         llm_response = client_llm.chat.completions.create(
