@@ -256,13 +256,13 @@ def generate_nlg_response(user_query, students, base_response):
                 f"""
 Student {i}
 
-School: {school}
+**School:** {school}
 
-Intended Major: {major}
+**Intended Major:** {major}
 
-Admitted Universities: {", ".join(set(admitted)) if admitted else "Not specified"}
+**Admitted Universities:** {", ".join(set(admitted)) if admitted else "Not specified"}
 
-Key Suggestions/Advice: {advice}
+**Key Suggestions/Advice:** {advice}
 """.strip()
             )
 
