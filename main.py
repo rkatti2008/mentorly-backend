@@ -255,10 +255,14 @@ def generate_nlg_response(user_query, students, base_response):
             student_blocks.append(
                 f"""
 Student {i}
+
 School: {school}
+
 Intended Major: {major}
+
 Admitted Universities: {", ".join(set(admitted)) if admitted else "Not specified"}
-Advice: {advice}
+
+Key Suggestions/Advice: {advice}
 """.strip()
             )
 
