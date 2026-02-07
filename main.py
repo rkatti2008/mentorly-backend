@@ -187,7 +187,7 @@ def extract_free_advice(row):
     return None
 
 # =========================================================
-# PHASE-6.3 ANALYTICS RESPONSE (UPGRADED)
+# PHASE-6.3 BASE ANALYTICS RESPONSE (DETERMINISTIC)
 # =========================================================
 
 def handle_analytics_response(query, students):
@@ -238,6 +238,80 @@ def handle_analytics_response(query, students):
         "assistant_answer": response.strip()
     }
 
+# =========================================================
+# PHASE-6.3 LLM NLG LAYER (SAFE + OPTIONAL)
+# =========================================================
+
+def generate_nlg_response(user_query, students, base_response):
+    try:
+        count = len(students)
+
+        student_blocks = []
+        for i, row in enumerate(students, start=1):
+            school = extract_school_name(row)
+            major = extract_major(row)
+
+            admitted = []
+            for col, cell in row.items():
+                if is_admit_column(col):
+                    admitted.extend(extract_universities(cell))
+
+            advice = extract_free_advice(row) or "No specific advice provided."
+
+            student_blocks.append(
+                f"""
+Student {i}:
+School: {school}
+Intended Major: {major}
+Admitted Universities: {", ".join(set(admitted)) if admitted else "Not specified"}
+Advice: {advice}
+""".strip()
+            )
+
+        prompt = f"""
+You are an education counselor assistant.
+
+Write a clear, helpful response based ONLY on the information below.
+
+Rules:
+- Do not add facts
+- Do not speculate
+- Use professional, simple English
+- Audience: Grade 11–12 students
+
+User Question:
+"{user_query}"
+
+Total students found: {count}
+
+Student Details:
+{chr(10).join(student_blocks)}
+
+Instructions:
+1. State the total count first
+2. Mention schools, majors, and admissions
+3. Summarize advice into actionable guidance
+4. Do not mention databases or records
+"""
+
+        llm_response = client_llm.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+
+        content = llm_response.choices[0].message.content.strip()
+        if not content:
+            raise ValueError("Empty LLM response")
+
+        return {
+            "intent": "analytics",
+            "assistant_answer": content
+        }
+
+    except Exception:
+        return base_response
+
 # -------------------------------
 # API
 # -------------------------------
@@ -273,9 +347,6 @@ User query:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
 
-    # -------------------------------
-    # Build mapped filters
-    # -------------------------------
     key_map = {
         "school": "school_name",
         "school_name": "school_name",
@@ -290,7 +361,6 @@ User query:
         if k_norm in key_map:
             mapped_filters[key_map[k_norm]] = v
 
-    # Fallback admit extraction
     if (
         intent == "analytics"
         and "admitted_university" not in mapped_filters
@@ -305,7 +375,6 @@ User query:
                     filters["admitted_university"] = canon
                     break
 
-    # Fallback school extraction
     if (
         intent == "analytics"
         and "school_name" not in mapped_filters
@@ -318,4 +387,5 @@ User query:
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
-    return handle_analytics_response(user_query, students)
+    base_response = handle_analytics_response(user_query, students)
+    return generate_nlg_response(user_query, students, base_response)
