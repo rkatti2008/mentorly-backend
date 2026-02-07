@@ -184,7 +184,7 @@ def extract_free_advice(row):
     return None
 
 # =========================================================
-# PHASE-6.3 BASE ANALYTICS RESPONSE (UNCHANGED)
+# PHASE-6.3 BASE ANALYTICS RESPONSE (FIXED)
 # =========================================================
 def handle_analytics_response(query, students):
     count = len(students)
@@ -234,7 +234,7 @@ def handle_analytics_response(query, students):
     }
 
 # =========================================================
-# PHASE-6.3 LLM NLG LAYER (PATCHED – formatting only)
+# PHASE-6.3 LLM NLG LAYER (FIXED)
 # =========================================================
 def generate_nlg_response(user_query, students, base_response):
     try:
@@ -271,7 +271,7 @@ Rules:
 - Do not add facts
 - Do not summarize or rewrite advice
 - Copy advice text verbatim
-- Use plain English (no markdown, no bullets, no symbols)
+- Use plain English (no markdown, no bullets)
 
 User Question:
 "{user_query}"
@@ -280,6 +280,11 @@ Total students found: {count}
 
 Student Details:
 {chr(10).join(student_blocks)}
+
+Instructions:
+1. State the total count
+2. List each student with school, major, admission
+3. Include full advice text exactly as provided
 """
 
         llm_response = client_llm.chat.completions.create(
@@ -289,10 +294,6 @@ Student Details:
         )
 
         content = llm_response.choices[0].message.content.strip()
-
-        # 🔧 FINAL PATCH: enforce clean formatting
-        content = content.replace("*", "").strip()
-
         if not content:
             raise ValueError("Empty LLM response")
 
@@ -338,6 +339,43 @@ User query:
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
+
+    key_map = {
+        "school": "school_name",
+        "school_name": "school_name",
+        "admitted": "admitted_university",
+        "admitted_univs": "admitted_university",
+        "admitted_university": "admitted_university"
+    }
+
+    mapped_filters = {}
+    for k, v in filters.items():
+        k_norm = normalize(k).replace(" ", "_")
+        if k_norm in key_map:
+            mapped_filters[key_map[k_norm]] = v
+
+    if (
+        intent == "analytics"
+        and "admitted_university" not in mapped_filters
+        and re.search(r"\b(admit|admitted|accepted|got into|get into)\b", user_query.lower())
+    ):
+        for canon, aliases in UNIVERSITY_ALIASES.items():
+            if canon in normalize(user_query):
+                filters["admitted_university"] = canon
+                break
+            for a in aliases:
+                if normalize(a) in normalize(user_query):
+                    filters["admitted_university"] = canon
+                    break
+
+    if (
+        intent == "analytics"
+        and "school_name" not in mapped_filters
+        and re.search(r"\bschool\b", user_query.lower())
+    ):
+        match = re.search(r"from\s+(.+?school)", user_query, re.IGNORECASE)
+        if match:
+            filters["school_name"] = match.group(1).strip()
 
     records = sheet.get_all_records()
     students = filter_students(records, filters)
