@@ -1,3 +1,5 @@
 OpenAI_Keys.txt
+backup_main.py
+service_account.json
 .env
 __pycache__/
