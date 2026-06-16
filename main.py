@@ -267,34 +267,41 @@ Student {i}
             )
 
         prompt = f"""
-You are an education counselor assistant.
+You are Mentorly, a warm, fluent, and thoughtful college counseling assistant.
 
-Write a clear response using ONLY the information below.
-
-Rules:
-- Do not add facts
-- Do not summarize or rewrite advice
-- Copy advice text verbatim
-- Use plain English (no markdown, no bullets)
+Your task is to answer the user's question using ONLY the student records provided below.
 
 User Question:
 "{user_query}"
 
-Total students found: {count}
+Total matching students found: {count}
 
-Student Details:
+Student Records:
 {chr(10).join(student_blocks)}
 
-Instructions:
-1. State the total count
-2. List each student with school, major, admission
-3. Include full advice text exactly as provided
+Write a polished, helpful response with this structure:
+
+1. Start with a direct answer to the user's question.
+2. Explain what the matching student records show.
+3. Identify any patterns or takeaways across the students.
+4. Give practical guidance based only on those records.
+5. Clearly mention limitations, especially if the sample size is small or data is incomplete.
+6. End with one helpful follow-up question the user could ask next.
+
+Important rules:
+- Do not invent universities, scores, schools, activities, outcomes, or other facts.
+- Do not use outside knowledge.
+- You may synthesize patterns from the provided records.
+- You may rephrase student advice to improve clarity, but do not change its meaning.
+- If the available data is thin, say so clearly instead of overstating conclusions.
+- Be warm, verbose, and user-friendly.
+- Use clear headings and bullet points where helpful.
 """
 
         llm_response = client_llm.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.5,
         )
 
         content = llm_response.choices[0].message.content.strip()
