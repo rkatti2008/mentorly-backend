@@ -239,6 +239,29 @@ def extract_school_name(row):
             return val
     return "Unknown School"
 
+def extract_city_of_graduation(row):
+    """Extract city of graduation if the Google Sheet has a city/location column.
+
+    This is intentionally conservative so we do not accidentally pick up
+    unrelated city fields. If no city is found, return None and omit it
+    from the student profile.
+    """
+    preferred_hints = [
+        "city of graduation",
+        "graduation city",
+        "school city",
+        "high school city",
+        "city",
+        "location"
+    ]
+
+    for hint in preferred_hints:
+        for col, val in row.items():
+            if hint in normalize(col) and val and str(val).strip().lower() not in ["na", "n/a", "none"]:
+                return str(val).strip()
+
+    return None
+
 def extract_major(row):
     for col, val in row.items():
         if "major" in normalize(col) and val:
@@ -258,6 +281,7 @@ def clean_assistant_markdown(text: str) -> str:
     text = text.replace("**", "")
     text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
     text = re.sub(r"(?mi)^\s*Direct Answer\s*:?\s*\n+", "", text)
+    text = re.sub(r"(?mi)^\s*What the Records Show\s*:?\s*\n+", "", text)
     return text.strip()
 
 # =========================================================
@@ -282,6 +306,7 @@ def handle_analytics_response(query, students):
 
     for row in students:
         school = extract_school_name(row)
+        city = extract_city_of_graduation(row)
         major = extract_major(row)
 
         admitted_univs = []
@@ -292,8 +317,11 @@ def handle_analytics_response(query, students):
         admitted_text = ", ".join(set(admitted_univs)) if admitted_univs else "University not specified"
         advice = extract_free_advice(row)
 
+        city_line = f"City of Graduation: {city}\n" if city else ""
+
         entry = (
             f"High School: {school}\n"
+            f"{city_line}"
             f"Intended Major: {major}\n"
             f"Admitted University: {admitted_text}"
         )
@@ -320,6 +348,7 @@ def generate_nlg_response(user_query, students, base_response):
         student_blocks = []
         for i, row in enumerate(students, start=1):
             school = extract_school_name(row)
+            city = extract_city_of_graduation(row)
             major = extract_major(row)
 
             admitted = []
@@ -334,6 +363,8 @@ def generate_nlg_response(user_query, students, base_response):
 Student {i}
 
 High School: {school}
+
+City of Graduation: {city if city else "Not specified"}
 
 Intended Major: {major}
 
@@ -359,10 +390,11 @@ Student Records:
 Write a polished, helpful response with this structure:
 
 1. Start immediately with a direct answer in a normal sentence. Do not use the heading "Direct Answer".
-2. Explain what the matching student records show.
-3. Identify any patterns or takeaways across the students.
-4. Give practical guidance based only on those records.
-5. End with one helpful follow-up question the user could ask next.
+2. In the next paragraph, directly describe the matching student profile(s). Do not use the heading "What the Records Show".
+3. If teacher names are explicitly mentioned in the Advice text, include a plain-text section titled "Teacher and Mentor Support".
+4. Include a plain-text section titled "Patterns and Takeaways".
+5. Include a plain-text section titled "Practical Guidance".
+6. End with one helpful follow-up question the user could ask next.
 
 Important rules:
 - Do not invent universities, scores, schools, activities, outcomes, teachers, EE supervisors, or other facts.
@@ -372,9 +404,14 @@ Important rules:
 - If the available data is thin, say so clearly in the normal answer, but do not create a separate "Limitations" section.
 - Be warm, conversational, and encouraging.
 - Write like an experienced college counselor.
-- Use plain text section titles only, such as "What the Records Show", "Patterns and Takeaways", "Practical Guidance", and "Suggested Next Question".
+- Do not use the section title "What the Records Show". After the first sentence, immediately describe the student profile(s).
+- Avoid phrases such as "the records show", "the dataset indicates", and "the student records indicate".
+- Use student-centric phrasing such as "The student graduated from...", "The student intends to major in...", and "The student was admitted to...".
+- If only one student matches, discuss that student specifically. Do not generalize from one student by saying "students aiming for" or "this record suggests that students". Use phrasing like "The student is aiming for...".
+- Use plain text section titles only, such as "Teacher and Mentor Support", "Patterns and Takeaways", "Practical Guidance", and "Suggested Next Question".
 - Do not use markdown formatting. Do not use #, ##, ###, or ** anywhere in the response.
-- When discussing individual students, always mention the student's High School, Intended Major, and Admitted Universities if those fields are available.
+- When discussing individual students, always mention the student's High School, City of Graduation if available, Intended Major, and Admitted Universities if those fields are available.
+- From the Advice text, extract teacher or mentor names only when they are explicitly stated. If a teacher helped with LOR, Extended Essay, projects, or research, mention that relationship clearly. If no teacher/mentor names are explicitly present, omit the "Teacher and Mentor Support" section entirely. Do not invent teacher names or roles.
 - Focus on actionable insights rather than simply listing students.
 """
 
