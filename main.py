@@ -252,6 +252,14 @@ def extract_free_advice(row):
                 return str(val).strip()
     return None
 
+
+def clean_assistant_markdown(text: str) -> str:
+    """Remove markdown artifacts from the LLM response before sending to the frontend."""
+    text = text.replace("**", "")
+    text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
+    text = re.sub(r"(?mi)^\s*Direct Answer\s*:?\s*\n+", "", text)
+    return text.strip()
+
 # =========================================================
 # PHASE-6.3 BASE ANALYTICS RESPONSE (FIXED)
 # =========================================================
@@ -285,7 +293,7 @@ def handle_analytics_response(query, students):
         advice = extract_free_advice(row)
 
         entry = (
-            f"School: {school}\n"
+            f"High School: {school}\n"
             f"Intended Major: {major}\n"
             f"Admitted University: {admitted_text}"
         )
@@ -325,13 +333,13 @@ def generate_nlg_response(user_query, students, base_response):
                 f"""
 Student {i}
 
-**School:** {school}
+High School: {school}
 
-**Intended Major:** {major}
+Intended Major: {major}
 
-**Admitted Universities:** {", ".join(set(admitted)) if admitted else "Not specified"}
+Admitted Universities: {", ".join(set(admitted)) if admitted else "Not specified"}
 
-**Key Suggestions/Advice:** {advice}
+Advice: {advice}
 """.strip()
             )
 
@@ -350,23 +358,24 @@ Student Records:
 
 Write a polished, helpful response with this structure:
 
-1. Start with a direct answer to the user's question.
+1. Start immediately with a direct answer in a normal sentence. Do not use the heading "Direct Answer".
 2. Explain what the matching student records show.
 3. Identify any patterns or takeaways across the students.
 4. Give practical guidance based only on those records.
 5. End with one helpful follow-up question the user could ask next.
 
 Important rules:
-- Do not invent universities, scores, schools, activities, outcomes, or other facts.
+- Do not invent universities, scores, schools, activities, outcomes, teachers, EE supervisors, or other facts.
 - Do not use outside knowledge.
 - You may synthesize patterns from the provided records.
 - You may rephrase student advice to improve clarity, but do not change its meaning.
-- If the available data is thin, say so clearly instead of overstating conclusions.
+- If the available data is thin, say so clearly in the normal answer, but do not create a separate "Limitations" section.
 - Be warm, conversational, and encouraging.
 - Write like an experienced college counselor.
-- Use clear headings and bullet points where helpful.
+- Use plain text section titles only, such as "What the Records Show", "Patterns and Takeaways", "Practical Guidance", and "Suggested Next Question".
+- Do not use markdown formatting. Do not use #, ##, ###, or ** anywhere in the response.
+- When discussing individual students, always mention the student's High School, Intended Major, and Admitted Universities if those fields are available.
 - Focus on actionable insights rather than simply listing students.
-- Do not include a separate "Limitations" section.
 """
 
         llm_response = client_llm.chat.completions.create(
@@ -375,7 +384,7 @@ Important rules:
             temperature=0.5,
         )
 
-        content = llm_response.choices[0].message.content.strip()
+        content = clean_assistant_markdown(llm_response.choices[0].message.content.strip())
         if not content:
             raise ValueError("Empty LLM response")
 
