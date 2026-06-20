@@ -117,13 +117,78 @@ def extract_universities(cell: str):
         if u.strip()
     ]
 
-def row_has_final_admit(row: dict, university: str) -> bool:
+def get_university_match_names(university: str):
+    """
+    Return a flexible set of normalized names for a university.
+
+    This is intentionally generic: it works for Cornell, UCSD, MIT,
+    and also for universities that are not listed in UNIVERSITY_ALIASES.
+    """
     target = normalize_university(university)
+    names = {target}
+
+    for canon, aliases in UNIVERSITY_ALIASES.items():
+        canon_norm = normalize_university(canon)
+        alias_norms = {normalize_university(a) for a in aliases}
+        all_names = {canon_norm, *alias_norms}
+
+        if target in all_names or any(target in name or name in target for name in all_names):
+            names.update(all_names)
+
+    return {name for name in names if name}
+
+def university_names_match(query_university: str, admitted_university: str) -> bool:
+    """
+    Flexible admit matching for all universities, not only hardcoded aliases.
+
+    Examples it handles:
+    - Cornell vs Cornell University
+    - UCSD vs University of California San Diego
+    - University of California Berkeley vs UC Berkeley
+    - Any other university where one name is contained in the other
+    """
+    admitted = normalize_university(admitted_university)
+    if not admitted:
+        return False
+
+    for target in get_university_match_names(query_university):
+        if admitted == target or target in admitted or admitted in target:
+            return True
+
+    return False
+
+def row_has_final_admit(row: dict, university: str) -> bool:
     for col, cell in row.items():
         if is_admit_column(col):
-            if target in set(extract_universities(cell)):
-                return True
+            for admitted in extract_universities(cell):
+                if university_names_match(university, admitted):
+                    return True
     return False
+
+def extract_admit_target_from_query(query: str):
+    """
+    Fallback extraction for natural questions like:
+    - How many students got admitted to Cornell?
+    - Tell me about students accepted to University of Michigan.
+    - Who got into UC Berkeley?
+
+    This helps when the LLM does not return a clean admitted_university filter.
+    """
+    q = clean_user_query(query)
+    patterns = [
+        r"(?:got|get)\s+into\s+(.+?)(?:[?.!,]|$)",
+        r"(?:admitted|accepted)\s+(?:to|into|at)\s+(.+?)(?:[?.!,]|$)",
+        r"(?:admit|admits|admission|admissions)\s+(?:to|into|at)\s+(.+?)(?:[?.!,]|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, q, re.IGNORECASE)
+        if match:
+            target = match.group(1).strip()
+            target = re.split(r"\s+from\s+|\s+at\s+|\s+in\s+", target, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            return target if target else None
+
+    return None
 
 # -------------------------------
 # Core Filter Engine (UNCHANGED)
@@ -144,6 +209,10 @@ def filter_students(records, filters):
         k_norm = normalize(k).replace(" ", "_")
         if k_norm in key_map:
             mapped_filters[key_map[k_norm]] = v
+        elif is_school_column(k):
+            mapped_filters["school_name"] = v
+        elif is_admit_column(k):
+            mapped_filters["admitted_university"] = v
 
     for row in records:
         ok = True
@@ -285,8 +354,7 @@ Write a polished, helpful response with this structure:
 2. Explain what the matching student records show.
 3. Identify any patterns or takeaways across the students.
 4. Give practical guidance based only on those records.
-5. Clearly mention limitations, especially if the sample size is small or data is incomplete.
-6. End with one helpful follow-up question the user could ask next.
+5. End with one helpful follow-up question the user could ask next.
 
 Important rules:
 - Do not invent universities, scores, schools, activities, outcomes, or other facts.
@@ -294,8 +362,11 @@ Important rules:
 - You may synthesize patterns from the provided records.
 - You may rephrase student advice to improve clarity, but do not change its meaning.
 - If the available data is thin, say so clearly instead of overstating conclusions.
-- Be warm, verbose, and user-friendly.
+- Be warm, conversational, and encouraging.
+- Write like an experienced college counselor.
 - Use clear headings and bullet points where helpful.
+- Focus on actionable insights rather than simply listing students.
+- Do not include a separate "Limitations" section.
 """
 
         llm_response = client_llm.chat.completions.create(
@@ -364,20 +435,18 @@ User query:
         k_norm = normalize(k).replace(" ", "_")
         if k_norm in key_map:
             mapped_filters[key_map[k_norm]] = v
+        elif is_school_column(k):
+            mapped_filters["school_name"] = v
+        elif is_admit_column(k):
+            mapped_filters["admitted_university"] = v
 
     if (
-        intent == "analytics"
-        and "admitted_university" not in mapped_filters
+        "admitted_university" not in mapped_filters
         and re.search(r"\b(admit|admitted|accepted|got into|get into)\b", user_query.lower())
     ):
-        for canon, aliases in UNIVERSITY_ALIASES.items():
-            if canon in normalize(user_query):
-                filters["admitted_university"] = canon
-                break
-            for a in aliases:
-                if normalize(a) in normalize(user_query):
-                    filters["admitted_university"] = canon
-                    break
+        admit_target = extract_admit_target_from_query(user_query)
+        if admit_target:
+            filters["admitted_university"] = admit_target
 
     if (
         intent == "analytics"
