@@ -276,6 +276,165 @@ def extract_free_advice(row):
     return None
 
 
+# =========================================================
+# PHASE-4 FOLLOW-UP TOPIC / COLUMN SUPPORT
+# =========================================================
+EMPTY_CELL_VALUES = {"", "na", "n/a", "none", "null", "not applicable", "not specified"}
+
+def is_non_empty_cell(val) -> bool:
+    return val is not None and str(val).strip().lower() not in EMPTY_CELL_VALUES
+
+def get_column_value(row: dict, candidate_names):
+    """Return a value from a row using exact/fuzzy column-name matching."""
+    normalized_candidates = [normalize(name) for name in candidate_names]
+
+    # Prefer exact normalized column matches first.
+    for col, val in row.items():
+        if normalize(col) in normalized_candidates and is_non_empty_cell(val):
+            return str(val).strip()
+
+    # Then allow conservative substring matching.
+    for col, val in row.items():
+        col_norm = normalize(col)
+        for cand in normalized_candidates:
+            if (cand in col_norm or col_norm in cand) and is_non_empty_cell(val):
+                return str(val).strip()
+
+    return None
+
+FOLLOWUP_FIELD_RULES = [
+    {
+        "label": "Academic Extra-curriculars",
+        "triggers": [
+            "course", "courses", "extracurricular", "extra curricular", "summer program",
+            "summer programs", "academic program", "academic programs", "academic project",
+            "academic projects", "research", "project", "projects", "activity", "activities"
+        ],
+        "columns": ["Academic Extra-curriculars", "Academic Extracurriculars", "Academic Extra Curriculars"],
+    },
+    {
+        "label": "Non-Academic Extra-curriculars",
+        "triggers": [
+            "extracurricular", "extra curricular", "non academic", "non-academic",
+            "non-academic activity", "non academic activity", "activity", "activities", "sports", "music", "art", "volunteer"
+        ],
+        "columns": ["Non-Academic Extra-curriculars", "Non Academic Extra-curriculars", "Non-Academic Extracurriculars"],
+    },
+    {
+        "label": "Financial Aid",
+        "triggers": ["financial aid", "scholarship", "scholarships", "aid", "funding"],
+        "columns": ["Financial Aid"],
+    },
+    {
+        "label": "Leadership Roles Held",
+        "triggers": ["lead role", "leadership", "leadership role", "leader", "captain", "president", "founder"],
+        "columns": ["Leadership roles held", "Leadership Roles Held"],
+    },
+    {
+        "label": "SAT Total Score",
+        "triggers": ["sat", "sat score", "sat total"],
+        "columns": ["SAT Total score", "SAT Total Score"],
+    },
+    {
+        "label": "ACT Score",
+        "triggers": ["act", "act score"],
+        "columns": ["ACT Score"],
+    },
+    {
+        "label": "AMC-10 Taken",
+        "triggers": ["amc-10 taken", "amc 10 taken", "took amc-10", "took amc 10"],
+        "columns": ["AMC-10 taken", "AMC 10 taken"],
+    },
+    {
+        "label": "AMC-12 Taken",
+        "triggers": ["amc-12 taken", "amc 12 taken", "took amc-12", "took amc 12"],
+        "columns": ["AMC-12 taken", "AMC 12 taken"],
+    },
+    {
+        "label": "AMC-10 Score",
+        "triggers": ["amc-10 score", "amc 10 score"],
+        "columns": ["AMC-10 Score", "AMC 10 Score"],
+    },
+    {
+        "label": "AMC-12 Score",
+        "triggers": ["amc-12 score", "amc 12 score"],
+        "columns": ["AMC-12 Score", "AMC 12 Score"],
+    },
+    {
+        "label": "AP Courses",
+        "triggers": ["ap course", "ap courses", "advanced placement", "ap exam", "ap exams"],
+        "columns": ["AP Courses"],
+    },
+    {
+        "label": "10th Board",
+        "triggers": ["10th board", "grade 10 board", "class 10 board", "tenth board"],
+        "columns": ["10th Board"],
+    },
+    {
+        "label": "12th Board",
+        "triggers": ["12th board", "grade 12 board", "class 12 board", "twelfth board"],
+        "columns": ["12th Board"],
+    },
+    {
+        "label": "9th Grade Scores",
+        "triggers": ["9th grade score", "9th grade scores", "grade 9 score", "grade 9 scores", "class 9 score"],
+        "columns": ["9th grade scores", "9th Grade Scores"],
+    },
+    {
+        "label": "10th Grade Scores",
+        "triggers": ["10th grade score", "10th grade scores", "grade 10 score", "grade 10 scores", "class 10 score"],
+        "columns": ["10th grade scores", "10th Grade Scores"],
+    },
+    {
+        "label": "11th Grade Overall Score",
+        "triggers": ["11th grade overall", "grade 11 overall", "class 11 overall", "11th overall"],
+        "columns": ["11th grade overall score", "11th Grade Overall Score"],
+    },
+    {
+        "label": "12th Grade Scores",
+        "triggers": ["12th grade score", "12th grade scores", "grade 12 score", "grade 12 scores", "class 12 score"],
+        "columns": ["12th grade scores", "12th Grade Scores"],
+    },
+    {
+        "label": "12th Grade Overall Score",
+        "triggers": ["12th grade overall", "grade 12 overall", "class 12 overall", "12th overall"],
+        "columns": ["12th grade overall score", "12th Grade Overall Score"],
+    },
+]
+
+def requested_followup_fields(user_query: str):
+    """Identify which database fields should be included for this query."""
+    q = normalize(user_query)
+    requested = []
+    seen_labels = set()
+
+    # Special case: a generic AMC query should include both taken and score fields.
+    if "amc" in q and "score" not in q and "taken" not in q:
+        for label in ["AMC-10 Taken", "AMC-10 Score", "AMC-12 Taken", "AMC-12 Score"]:
+            for rule in FOLLOWUP_FIELD_RULES:
+                if rule["label"] == label and label not in seen_labels:
+                    requested.append(rule)
+                    seen_labels.add(label)
+
+    for rule in FOLLOWUP_FIELD_RULES:
+        if rule["label"] in seen_labels:
+            continue
+        if any(trigger in q for trigger in rule["triggers"]):
+            requested.append(rule)
+            seen_labels.add(rule["label"])
+
+    return requested
+
+def format_requested_followup_details(row: dict, requested_rules) -> str:
+    """Build a concise block of requested profile details for the LLM context."""
+    lines = []
+    for rule in requested_rules:
+        val = get_column_value(row, rule["columns"])
+        if val:
+            lines.append(f'{rule["label"]}: {val}')
+    return "\n".join(lines)
+
+
 def clean_assistant_markdown(text: str) -> str:
     """Remove markdown artifacts from the LLM response before sending to the frontend."""
     text = text.replace("**", "")
@@ -344,6 +503,8 @@ def handle_analytics_response(query, students):
 def generate_nlg_response(user_query, students, base_response):
     try:
         count = len(students)
+        followup_rules = requested_followup_fields(user_query)
+        requested_field_labels = [rule["label"] for rule in followup_rules]
 
         student_blocks = []
         for i, row in enumerate(students, start=1):
@@ -357,6 +518,12 @@ def generate_nlg_response(user_query, students, base_response):
                     admitted.extend(extract_universities(cell))
 
             advice = extract_free_advice(row) or "No advice provided."
+            requested_details = format_requested_followup_details(row, followup_rules)
+            requested_details_block = (
+                f"\n\nRequested Follow-up Details:\n{requested_details}"
+                if requested_details
+                else ""
+            )
 
             student_blocks.append(
                 f"""
@@ -370,7 +537,7 @@ Intended Major: {major}
 
 Admitted Universities: {", ".join(set(admitted)) if admitted else "Not specified"}
 
-Advice: {advice}
+Advice: {advice}{requested_details_block}
 """.strip()
             )
 
@@ -384,6 +551,9 @@ User Question:
 
 Total matching students found: {count}
 
+Requested follow-up field categories detected from the user question:
+{", ".join(requested_field_labels) if requested_field_labels else "None"}
+
 Student Records:
 {chr(10).join(student_blocks)}
 
@@ -391,16 +561,19 @@ Write a polished, helpful response with this structure:
 
 1. Start immediately with a direct answer in a normal sentence. Do not use the heading "Direct Answer".
 2. In the next paragraph, directly describe the matching student profile(s). Do not use the heading "What the Records Show".
-3. If teacher names are explicitly mentioned in the Advice text, include a plain-text section titled "Teacher and Mentor Support".
-4. Include a plain-text section titled "Patterns and Takeaways".
-5. Include a plain-text section titled "Practical Guidance".
-6. End with one helpful follow-up question the user could ask next.
+3. If the user asks about SAT, ACT, AMC, AP courses, academics, boards, grades, extracurricular activities, summer programs, academic programs, projects, leadership, financial aid, or scholarships, answer using the "Requested Follow-up Details" provided in each student record.
+4. If teacher names are explicitly mentioned in the Advice text, include a plain-text section titled "Teacher and Mentor Support".
+5. Include a plain-text section titled "Patterns and Takeaways" when there is enough relevant information.
+6. Include a plain-text section titled "Practical Guidance".
+7. End with one helpful, self-contained follow-up question the user could ask next. The follow-up question should include the university, school, or student context where possible, not vague phrases like "this student".
 
 Important rules:
 - Do not invent universities, scores, schools, activities, outcomes, teachers, EE supervisors, or other facts.
 - Do not use outside knowledge.
 - You may synthesize patterns from the provided records.
 - You may rephrase student advice to improve clarity, but do not change its meaning.
+- If the user asks about a specific data category, such as SAT, AP courses, extracurriculars, leadership, financial aid, AMC, ACT, boards, or grade scores, prioritize the corresponding Requested Follow-up Details and do not answer generically when those details are available.
+- If requested follow-up details are unavailable for a matching student, say that the field is not specified for that student rather than guessing.
 - If the available data is thin, say so clearly in the normal answer, but do not create a separate "Limitations" section.
 - Be warm, conversational, and encouraging.
 - Write like an experienced college counselor.
