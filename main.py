@@ -3,6 +3,8 @@ from fastapi import FastAPI
 from openai import OpenAI
 from pydantic import BaseModel
 from typing import Optional
+from datetime import datetime
+from collections import Counter
 import gspread
 from google.oauth2.service_account import Credentials
 import os, json, re
@@ -36,13 +38,33 @@ sheet = gspread.authorize(creds).open_by_key(os.environ["SHEET_ID"]).sheet1
 client_llm = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # -------------------------------
-# Lightweight Conversation Memory
+# Persistent Conversation Memory
 # -------------------------------
-# Render instances are stateless across restarts, so this memory is intentionally
-# lightweight and in-process. It works well for short chat sessions while the
-# same backend instance is running. For production-grade memory, replace this
-# with Redis, a database, or frontend-managed conversation state.
-SESSION_MEMORY = {}
+# The app keeps session context in memory and also writes it to a small JSON file.
+# On Render this is still lightweight, but it survives ordinary app reloads while
+# the filesystem is preserved. For heavier production usage, replace this with
+# Redis, Supabase, Postgres, or another persistent store.
+SESSION_STORE_PATH = os.environ.get("SESSION_STORE_PATH", "session_memory.json")
+
+def load_session_memory():
+    try:
+        if os.path.exists(SESSION_STORE_PATH):
+            with open(SESSION_STORE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def save_session_memory():
+    try:
+        with open(SESSION_STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(SESSION_MEMORY, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # Never break the API because session persistence failed.
+        pass
+
+SESSION_MEMORY = load_session_memory()
 
 
 # -------------------------------
@@ -53,13 +75,46 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = "default"
 
 # -------------------------------
+# High-level Query Type Detection
+# -------------------------------
+def is_similar_student_query(q: str) -> bool:
+    q = str(q).lower()
+    return any(k in q for k in [
+        "similar student", "similar students", "students similar to me",
+        "similar to my profile", "similar profile", "my profile",
+        "matches my profile", "match my profile", "closest profiles"
+    ])
+
+def is_dashboard_query(q: str) -> bool:
+    q = str(q).lower()
+    return any(k in q for k in [
+        "dashboard", "overall stats", "overall statistics", "database summary",
+        "summary of database", "show me stats", "admissions dashboard"
+    ])
+
+def is_university_insights_query(q: str) -> bool:
+    q = str(q).lower()
+    return any(k in q for k in [
+        "university insights", "college insights", "insights for", "insights about",
+        "applicants to", "applicants for", "tell me about applicants",
+        "tell me about students applying", "profile of students admitted",
+        "admitted students at", "admits to"
+    ])
+
+# -------------------------------
 # Intent Classification
 # -------------------------------
 def classify_intent(q: str) -> str:
     q = q.lower()
+    if is_similar_student_query(q):
+        return "similarity"
+    if is_dashboard_query(q):
+        return "dashboard"
+    if is_university_insights_query(q):
+        return "university_insights"
     if any(k in q for k in ["how many", "count", "number of"]):
         return "analytics"
-    if any(k in q for k in ["advice", "guidance", "counsel"]):
+    if any(k in q for k in ["advice", "guidance", "counsel", "what should i", "how can i improve", "chance", "chances", "recommend"]):
         return "advisory"
     return "hybrid"
 
@@ -338,7 +393,9 @@ def update_memory(session_id: str, user_query: str, filters: dict, students: lis
         "last_filters": dict(filters or {}),
         "last_match_count": len(students),
         "last_students": [student_memory_keys(row) for row in students],
+        "updated_at": datetime.utcnow().isoformat() + "Z",
     }
+    save_session_memory()
 
 def apply_memory_to_filters(user_query: str, filters: dict, session_id: str) -> dict:
     """Merge previous filters into follow-up queries when the user omits context."""
@@ -841,6 +898,375 @@ def build_pattern_analytics(students: list, requested_rules: list) -> str:
 
     return "\n".join(lines)
 
+
+# =========================================================
+# PHASE-8 ADVANCED FEATURES: ADVISORY, SIMILARITY, INSIGHTS, DASHBOARD
+# =========================================================
+def get_all_admitted_universities(row: dict):
+    admitted = []
+    for col, cell in row.items():
+        if is_admit_column(col):
+            admitted.extend(extract_universities(cell))
+    return sorted(set([u for u in admitted if u]))
+
+def is_university_applied_column(col_name: str) -> bool:
+    col = normalize(col_name)
+    return "appl" in col and "countr" not in col and any(k in col for k in ["univ", "college", "school"])
+
+def row_has_university_in_applied_or_admitted(row: dict, university: str) -> bool:
+    if row_has_final_admit(row, university):
+        return True
+    for col, cell in row.items():
+        if is_university_applied_column(col):
+            for uni in extract_universities(cell):
+                if university_names_match(university, uni):
+                    return True
+    return False
+
+def extract_university_mentioned_in_query(query: str, records=None):
+    target = extract_admit_target_from_query(query)
+    if target:
+        return target
+
+    q = clean_user_query(query)
+    patterns = [
+        r"(?:insights|applicants|students|profile|profiles|advice|guidance)\s+(?:for|about|to|at)\s+(.+?)(?:[?.!,]|$)",
+        r"(?:for|about|to|at)\s+([A-Z][A-Za-z& .'-]+?)(?:\s+(?:applicants|admits|students|admissions))?(?:[?.!,]|$)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, q, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            candidate = re.sub(r"\b(applicants|admits|students|admissions|university|college insights)$", "", candidate, flags=re.IGNORECASE).strip()
+            if candidate and len(candidate) > 1 and not is_generic_country_college_target(candidate):
+                return candidate
+
+    # Fallback: scan known admitted universities from the database and find one named in the query.
+    if records:
+        q_norm = normalize(q)
+        known = set()
+        for row in records:
+            known.update(get_all_admitted_universities(row))
+        for uni in sorted(known, key=len, reverse=True):
+            if uni and (uni in q_norm or q_norm in uni):
+                return uni
+    return None
+
+def build_student_profile_block(row: dict, index: int = 1, requested_rules=None) -> str:
+    requested_rules = requested_rules or []
+    school = extract_school_name(row)
+    city = extract_city_of_graduation(row)
+    major = extract_major(row)
+    admitted = get_all_admitted_universities(row)
+    advice = extract_free_advice(row) or "No advice provided."
+    requested_details = format_requested_followup_details(row, requested_rules)
+    requested_details_block = f"\nRequested Details:\n{requested_details}" if requested_details else ""
+    student_id = extract_student_id(row)
+    id_line = f"Student ID: {student_id}\n" if student_id else ""
+    return f"""
+Student {index}
+{id_line}High School: {school}
+City of Graduation: {city if city else "Not specified"}
+Intended Major: {major}
+Admitted Universities: {", ".join(admitted) if admitted else "Not specified"}
+Advice: {advice}{requested_details_block}
+""".strip()
+
+def answer_with_llm(intent: str, user_query: str, students: list, prompt_instructions: str, requested_rules=None, session_id="default"):
+    requested_rules = requested_rules or requested_followup_fields(user_query)
+    pattern_analytics = build_pattern_analytics(students, requested_rules)
+    blocks = [build_student_profile_block(row, i, requested_rules) for i, row in enumerate(students[:12], start=1)]
+    prompt = f"""
+You are Mentorly, a warm, fluent, and thoughtful college counseling assistant.
+
+Answer the user using ONLY the student records and deterministic analytics below.
+
+User Question:
+"{user_query}"
+
+Intent:
+{intent}
+
+Total matching students available: {len(students)}
+
+Deterministic Pattern Analytics:
+{pattern_analytics}
+
+Student Records:
+{chr(10).join(blocks) if blocks else "No matching student records."}
+
+Instructions for this answer:
+{prompt_instructions}
+
+Global rules:
+- Do not invent universities, scores, schools, activities, financial aid, teachers, outcomes, or other facts.
+- Do not use outside knowledge.
+- Numerical claims must come from Deterministic Pattern Analytics or the student records.
+- Be warm, concrete, and counselor-like.
+- Use plain text section titles only. Do not use #, ##, ###, or **.
+- If the data is thin, say that gently in the normal answer, not as a separate Limitations section.
+- End with one helpful, self-contained follow-up question.
+"""
+    try:
+        llm_response = client_llm.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.45,
+        )
+        content = clean_assistant_markdown(llm_response.choices[0].message.content.strip())
+        return {"intent": intent, "assistant_answer": content}
+    except Exception:
+        return handle_analytics_response(user_query, students)
+
+def extract_filters_for_query(user_query: str):
+    all_columns = sheet.row_values(1)
+    normalized_columns = [normalize(col).replace(" ", "_") for col in all_columns]
+    prompt = f"""
+Convert the user query into JSON.
+Allowed keys:
+{', '.join(normalized_columns)}
+
+User query:
+"{user_query}"
+"""
+    try:
+        raw = client_llm.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        ).choices[0].message.content
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        filters = json.loads(match.group()) if match else {}
+    except Exception:
+        filters = {}
+    filters = sanitize_filters_for_country_college_query(user_query, filters)
+    if re.search(r"\b(admit|admitted|accepted|got into|get into)\b", user_query.lower()):
+        mapped = {}
+        for k, v in filters.items():
+            k_norm = normalize(k).replace(" ", "_")
+            if k_norm in {"admitted", "admitted_univs", "admitted_university"} or is_admit_column(k):
+                mapped["admitted_university"] = v
+        if "admitted_university" not in mapped:
+            admit_target = extract_admit_target_from_query(user_query)
+            if admit_target:
+                filters["admitted_university"] = admit_target
+    if re.search(r"\bschool\b", user_query.lower()):
+        has_school = any(normalize(k).replace(" ", "_") in {"school", "school_name"} or is_school_column(k) for k in filters)
+        if not has_school:
+            match = re.search(r"from\s+(.+?school)", user_query, re.IGNORECASE)
+            if match:
+                filters["school_name"] = match.group(1).strip()
+    return sanitize_filters_for_country_college_query(user_query, filters)
+
+def handle_advisory_flow(user_query: str, records: list, session_id: str):
+    filters = extract_filters_for_query(user_query)
+    university = extract_university_mentioned_in_query(user_query, records)
+    if university and "admitted_university" not in {normalize(k).replace(" ", "_"): v for k, v in filters.items()}:
+        filters["admitted_university"] = university
+    students = filter_students(records, filters) if filters else records
+    if not students and university:
+        students = [row for row in records if row_has_university_in_applied_or_admitted(row, university)]
+    students = students[:12]
+    update_memory(session_id, user_query, filters, students)
+    instructions = """
+This is an advisory answer. Give practical guidance grounded in similar or relevant student records.
+Structure:
+1. Start with a direct, reassuring answer.
+2. Summarize the most relevant student examples.
+3. Give specific advice grounded in those examples: academics, testing, activities, leadership, projects/research, recommendations, and financial aid only if those appear in the records.
+4. Do not imply guaranteed admission or use outside admissions knowledge.
+5. If no strong matching records exist, say what the database can and cannot support, then give cautious guidance based only on available rows.
+"""
+    return answer_with_llm("advisory", user_query, students, instructions, requested_followup_fields(user_query), session_id)
+
+def parse_user_profile_from_query(user_query: str) -> dict:
+    q = user_query
+    profile = {}
+    sat = re.search(r"\bSAT\D{0,12}(\d{3,4})\b|\b(\d{3,4})\D{0,12}SAT\b", q, re.IGNORECASE)
+    if sat:
+        profile["sat"] = int(next(g for g in sat.groups() if g))
+    act = re.search(r"\bACT\D{0,12}(\d{1,2})\b|\b(\d{1,2})\D{0,12}ACT\b", q, re.IGNORECASE)
+    if act:
+        profile["act"] = int(next(g for g in act.groups() if g))
+    major_match = re.search(r"(?:major(?:ing)? in|interested in|for)\s+([A-Za-z /&-]{2,60})(?:[.,;]|$)", q, re.IGNORECASE)
+    if major_match:
+        profile["major"] = major_match.group(1).strip()
+    country = query_mentions_country_colleges(q)
+    if country:
+        profile["country"] = country
+    return profile
+
+def score_similarity(row: dict, profile: dict, query: str) -> tuple:
+    score = 0
+    reasons = []
+    q_norm = normalize(query)
+
+    major = extract_major(row)
+    if profile.get("major") and profile["major"]:
+        if normalize(profile["major"]) in normalize(major) or normalize(major) in normalize(profile["major"]):
+            score += 30
+            reasons.append(f"similar intended major ({major})")
+    elif major and any(tok in normalize(major) for tok in q_norm.split() if len(tok) > 3):
+        score += 15
+        reasons.append(f"related major ({major})")
+
+    sat_val = get_column_value(row, ["SAT Total score", "SAT Total Score"])
+    sat_num = extract_number(sat_val) if sat_val else None
+    if profile.get("sat") and sat_num:
+        diff = abs(profile["sat"] - sat_num)
+        if diff <= 30:
+            score += 30
+        elif diff <= 80:
+            score += 20
+        elif diff <= 150:
+            score += 10
+        if diff <= 150:
+            reasons.append(f"SAT is close ({sat_val})")
+
+    act_val = get_column_value(row, ["ACT Score"])
+    act_num = extract_number(act_val) if act_val else None
+    if profile.get("act") and act_num:
+        diff = abs(profile["act"] - act_num)
+        if diff <= 1:
+            score += 25
+        elif diff <= 3:
+            score += 15
+        if diff <= 3:
+            reasons.append(f"ACT is close ({act_val})")
+
+    if profile.get("country") and row_has_country_applied_to(row, profile["country"]):
+        score += 15
+        reasons.append(f"applied to {profile['country'].upper()} colleges")
+
+    # Keyword overlap with activities/advice gives a lightweight profile match.
+    searchable = " ".join(str(v) for v in row.values())
+    overlap = 0
+    for token in set(q_norm.split()):
+        if len(token) >= 5 and token in normalize(searchable):
+            overlap += 1
+    if overlap:
+        score += min(20, overlap * 3)
+        reasons.append("overlapping activities/interests")
+
+    if row_has_any_final_admit(row):
+        score += 5
+    return score, reasons
+
+def handle_similar_student_search(user_query: str, records: list, session_id: str):
+    profile = parse_user_profile_from_query(user_query)
+    scored = []
+    for row in records:
+        score, reasons = score_similarity(row, profile, user_query)
+        if score > 0:
+            scored.append((score, reasons, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    students = [row for _, _, row in scored[:5]]
+    if not students:
+        students = records[:5]
+    for idx, (score, reasons, row) in enumerate(scored[:5]):
+        row["_similarity_score"] = score
+        row["_similarity_reasons"] = "; ".join(reasons) if reasons else "general profile overlap"
+    update_memory(session_id, user_query, {"similarity_search": True, "profile": profile}, students)
+    instructions = """
+This is a similar-student search. Explain which database students look closest to the user's profile.
+Structure:
+1. Start with a direct answer that these are the closest matching profiles found.
+2. For each student, mention high school, city, intended major, admits, and why the profile seems similar when available.
+3. Use SAT, ACT, activities, major, country, and other fields only when present in records.
+4. Give practical guidance based on the similarities.
+5. Do not call this a perfect match; say it is a directional match from the database.
+"""
+    return answer_with_llm("similarity", user_query, students, instructions, requested_followup_fields(user_query), session_id)
+
+def handle_university_insights(user_query: str, records: list, session_id: str):
+    university = extract_university_mentioned_in_query(user_query, records)
+    if not university:
+        return {"intent": "university_insights", "assistant_answer": "Please mention the university name so I can build the university insights view."}
+    students = [row for row in records if row_has_university_in_applied_or_admitted(row, university)]
+    admitted_students = [row for row in students if row_has_final_admit(row, university)]
+    context_students = admitted_students or students
+    filters = {"admitted_university": university} if admitted_students else {"university_interest": university}
+    update_memory(session_id, user_query, filters, context_students)
+    requested = requested_followup_fields(user_query)
+    # Add important fields for an insights page even if not explicitly requested.
+    for label in ["SAT Total Score", "ACT Score", "AP Courses", "Academic Extra-curriculars", "Non-Academic Extra-curriculars", "Financial Aid", "Leadership Roles Held"]:
+        for rule in FOLLOWUP_FIELD_RULES:
+            if rule["label"] == label and all(r["label"] != label for r in requested):
+                requested.append(rule)
+    instructions = f"""
+This is a University Insights Page for {university}.
+Structure:
+1. Start with a short overview: how many relevant profiles were found and how many were admitted when available.
+2. Summarize admitted-student profiles first if any exist.
+3. Include patterns in majors, schools/cities, scores, activities, leadership, financial aid, and advice only when those fields are present.
+4. Keep it grounded and avoid outside admissions commentary.
+5. Make it useful as a mini admissions intelligence page for this university.
+"""
+    return answer_with_llm("university_insights", user_query, context_students, instructions, requested, session_id)
+
+def build_dashboard_payload(records: list) -> dict:
+    total = len(records)
+    admitted_rows = [r for r in records if row_has_any_final_admit(r)]
+    high_schools = Counter(extract_school_name(r) for r in records if extract_school_name(r) != "Unknown School")
+    cities = Counter(extract_city_of_graduation(r) for r in records if extract_city_of_graduation(r))
+    majors = Counter(extract_major(r) for r in records if extract_major(r) != "Undeclared")
+    admitted_unis = Counter()
+    for r in records:
+        admitted_unis.update(get_all_admitted_universities(r))
+    sat_values = []
+    for r in records:
+        sat = get_column_value(r, ["SAT Total score", "SAT Total Score"])
+        n = extract_number(sat) if sat else None
+        if n:
+            sat_values.append(n)
+    return {
+        "total_students": total,
+        "students_with_final_admits": len(admitted_rows),
+        "top_high_schools": high_schools.most_common(10),
+        "top_cities": cities.most_common(10),
+        "top_intended_majors": majors.most_common(10),
+        "top_admitted_universities": admitted_unis.most_common(15),
+        "sat_summary": {
+            "count": len(sat_values),
+            "min": min(sat_values) if sat_values else None,
+            "max": max(sat_values) if sat_values else None,
+            "average": round(sum(sat_values) / len(sat_values), 1) if sat_values else None,
+        },
+    }
+
+def format_dashboard_text(payload: dict) -> str:
+    def fmt_pairs(pairs):
+        return "\n".join([f"- {name}: {count}" for name, count in pairs]) if pairs else "Not enough data specified."
+    sat = payload["sat_summary"]
+    sat_text = "Not enough SAT data specified."
+    if sat["count"]:
+        sat_text = f"{sat['count']} scores available; range {sat['min']}–{sat['max']}; average {sat['average']}."
+    return f"""
+Dashboard Summary
+
+Total students in database: {payload['total_students']}
+Students with final admits listed: {payload['students_with_final_admits']}
+
+Top High Schools
+{fmt_pairs(payload['top_high_schools'])}
+
+Top Cities
+{fmt_pairs(payload['top_cities'])}
+
+Top Intended Majors
+{fmt_pairs(payload['top_intended_majors'])}
+
+Top Admitted Universities
+{fmt_pairs(payload['top_admitted_universities'])}
+
+SAT Summary
+{sat_text}
+""".strip()
+
+def handle_dashboard_query(user_query: str, records: list, session_id: str):
+    payload = build_dashboard_payload(records)
+    return {"intent": "dashboard", "assistant_answer": format_dashboard_text(payload), "dashboard": payload}
+
 def clean_assistant_markdown(text: str) -> str:
     """Remove markdown artifacts from the LLM response before sending to the frontend."""
     text = text.replace("**", "")
@@ -1030,81 +1456,24 @@ async def nl_query(req: ChatRequest):
     user_query = clean_user_query(req.message)
     session_id = get_session_key(req)
     intent = classify_intent(user_query)
+    records = sheet.get_all_records()
+
+    # New feature routes. These are additive and do not disturb the existing analytics flow.
+    if intent == "dashboard":
+        return handle_dashboard_query(user_query, records, session_id)
+
+    if intent == "similarity":
+        return handle_similar_student_search(user_query, records, session_id)
+
+    if intent == "university_insights":
+        return handle_university_insights(user_query, records, session_id)
 
     if intent == "advisory":
-        return {
-            "intent": "advisory",
-            "assistant_answer": "Advisory flow unchanged."
-        }
+        return handle_advisory_flow(user_query, records, session_id)
 
-    all_columns = sheet.row_values(1)
-    normalized_columns = [normalize(col).replace(" ", "_") for col in all_columns]
-
-    prompt = f"""
-Convert the user query into JSON.
-Allowed keys:
-{', '.join(normalized_columns)}
-
-User query:
-"{user_query}"
-"""
-
-    raw = client_llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    ).choices[0].message.content
-
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    filters = json.loads(match.group()) if match else {}
-
-    # Handle queries like "Greenwood High School admitted into US colleges".
-    # This means: country = USA and at least one final admitted university.
-    # It should not be treated as a university named "US colleges".
-    filters = sanitize_filters_for_country_college_query(user_query, filters)
-
-    key_map = {
-        "school": "school_name",
-        "school_name": "school_name",
-        "admitted": "admitted_university",
-        "admitted_univs": "admitted_university",
-        "admitted_university": "admitted_university",
-        "country_applied_to": "country_applied_to",
-        "require_any_final_admit": "require_any_final_admit"
-    }
-
-    mapped_filters = {}
-    for k, v in filters.items():
-        k_norm = normalize(k).replace(" ", "_")
-        if k_norm in key_map:
-            mapped_filters[key_map[k_norm]] = v
-        elif is_school_column(k):
-            mapped_filters["school_name"] = v
-        elif is_admit_column(k):
-            mapped_filters["admitted_university"] = v
-
-    if (
-        "admitted_university" not in mapped_filters
-        and re.search(r"\b(admit|admitted|accepted|got into|get into)\b", user_query.lower())
-    ):
-        admit_target = extract_admit_target_from_query(user_query)
-        if admit_target:
-            filters["admitted_university"] = admit_target
-
-    filters = sanitize_filters_for_country_college_query(user_query, filters)
-
-    if (
-        intent == "analytics"
-        and "school_name" not in mapped_filters
-        and re.search(r"\bschool\b", user_query.lower())
-    ):
-        match = re.search(r"from\s+(.+?school)", user_query, re.IGNORECASE)
-        if match:
-            filters["school_name"] = match.group(1).strip()
+    filters = extract_filters_for_query(user_query)
 
     explicit_context_in_current_query = filter_has_explicit_student_context(filters)
-
-    records = sheet.get_all_records()
 
     # Student profile memory:
     # For follow-ups like "What about their SAT scores?" or "Did they get financial aid?",
@@ -1127,3 +1496,19 @@ User query:
 
     base_response = handle_analytics_response(user_query, students)
     return generate_nlg_response(user_query, students, base_response, session_id=session_id)
+
+@app.get("/dashboard")
+async def dashboard():
+    records = sheet.get_all_records()
+    return build_dashboard_payload(records)
+
+@app.get("/session/{session_id}")
+async def get_session(session_id: str):
+    return get_memory(session_id)
+
+@app.delete("/session/{session_id}")
+async def clear_session(session_id: str):
+    if session_id in SESSION_MEMORY:
+        SESSION_MEMORY.pop(session_id, None)
+        save_session_memory()
+    return {"status": "cleared", "session_id": session_id}
