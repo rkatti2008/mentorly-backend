@@ -177,6 +177,96 @@ def row_has_final_admit(row: dict, university: str) -> bool:
                     return True
     return False
 
+def row_has_any_final_admit(row: dict) -> bool:
+    """Return True if the row has at least one final admitted university listed."""
+    for col, cell in row.items():
+        if is_admit_column(col) and str(cell).strip().lower() not in ["", "na", "n/a", "none"]:
+            return True
+    return False
+
+COUNTRY_ALIASES = {
+    "usa": ["usa", "us", "u s", "united states", "united states of america", "america"],
+    "uk": ["uk", "u k", "united kingdom", "england", "scotland", "wales"],
+    "canada": ["canada"],
+    "singapore": ["singapore"],
+    "india": ["india"],
+}
+
+def normalize_country(country: str) -> str:
+    c = normalize(country)
+    for canon, aliases in COUNTRY_ALIASES.items():
+        if c == canon or c in aliases:
+            return canon
+    return c
+
+def country_names_match(query_country: str, cell_value: str) -> bool:
+    target = normalize_country(query_country)
+    cell = normalize_country(cell_value)
+    if not target or not cell:
+        return False
+
+    names = {target}
+    for canon, aliases in COUNTRY_ALIASES.items():
+        all_names = {normalize_country(canon), *[normalize_country(a) for a in aliases]}
+        if target in all_names:
+            names.update(all_names)
+
+    return any(name == cell or name in cell or cell in name for name in names)
+
+def is_countries_applied_column(col_name: str) -> bool:
+    col = normalize(col_name)
+    return "countr" in col and "appl" in col
+
+def row_has_country_applied_to(row: dict, country: str) -> bool:
+    for col, cell in row.items():
+        if is_countries_applied_column(col):
+            parts = [p.strip() for p in re.split(r"[;,/|]", str(cell)) if p.strip()]
+            if any(country_names_match(country, part) for part in parts):
+                return True
+    return False
+
+def is_generic_country_college_target(target: str) -> bool:
+    """Detect phrases like 'US colleges' that are not university names."""
+    t = normalize(target)
+    generic_words = ["college", "colleges", "university", "universities", "school", "schools", "institutions"]
+    country_words = []
+    for canon, aliases in COUNTRY_ALIASES.items():
+        country_words.extend([canon, *aliases])
+    return any(cw in t for cw in country_words) and any(gw in t for gw in generic_words)
+
+def query_mentions_country_colleges(query: str):
+    """Return country canon such as 'usa' when query asks for US/UK/etc colleges."""
+    q = normalize(query)
+    generic = any(w in q for w in ["college", "colleges", "university", "universities", "schools"])
+    if not generic:
+        return None
+    for canon, aliases in COUNTRY_ALIASES.items():
+        if any(alias in q for alias in [canon, *aliases]):
+            return canon
+    return None
+
+def sanitize_filters_for_country_college_query(user_query: str, filters: dict) -> dict:
+    """Convert 'US colleges' style queries into country + any-admit filters.
+
+    Without this, the LLM or regex can mistakenly treat 'US colleges' as a
+    specific admitted university, which produces zero matches.
+    """
+    filters = dict(filters or {})
+    country = query_mentions_country_colleges(user_query)
+
+    for k in list(filters.keys()):
+        k_norm = normalize(k).replace(" ", "_")
+        is_admit_filter = k_norm in ["admitted", "admitted_univs", "admitted_university"] or is_admit_column(k)
+        if is_admit_filter and is_generic_country_college_target(str(filters[k])):
+            filters.pop(k, None)
+
+    if country:
+        filters["country_applied_to"] = country
+        if re.search(r"\b(admit|admitted|accepted|got into|get into)\b", user_query.lower()):
+            filters["require_any_final_admit"] = True
+
+    return filters
+
 def extract_admit_target_from_query(query: str):
     """
     Fallback extraction for natural questions like:
@@ -198,7 +288,9 @@ def extract_admit_target_from_query(query: str):
         if match:
             target = match.group(1).strip()
             target = re.split(r"\s+from\s+|\s+at\s+|\s+in\s+", target, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-            return target if target else None
+            if target and not is_generic_country_college_target(target):
+                return target
+            return None
 
     return None
 
@@ -281,7 +373,9 @@ def filter_students(records, filters):
         "school_name": "school_name",
         "admitted": "admitted_university",
         "admitted_univs": "admitted_university",
-        "admitted_university": "admitted_university"
+        "admitted_university": "admitted_university",
+        "country_applied_to": "country_applied_to",
+        "require_any_final_admit": "require_any_final_admit"
     }
 
     mapped_filters = {}
@@ -303,6 +397,13 @@ def filter_students(records, filters):
 
         admit = mapped_filters.get("admitted_university")
         if ok and admit and not row_has_final_admit(row, admit):
+            ok = False
+
+        country = mapped_filters.get("country_applied_to")
+        if ok and country and not row_has_country_applied_to(row, country):
+            ok = False
+
+        if ok and mapped_filters.get("require_any_final_admit") and not row_has_any_final_admit(row):
             ok = False
 
         if ok:
@@ -726,12 +827,19 @@ User query:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     filters = json.loads(match.group()) if match else {}
 
+    # Handle queries like "Greenwood High School admitted into US colleges".
+    # This means: country = USA and at least one final admitted university.
+    # It should not be treated as a university named "US colleges".
+    filters = sanitize_filters_for_country_college_query(user_query, filters)
+
     key_map = {
         "school": "school_name",
         "school_name": "school_name",
         "admitted": "admitted_university",
         "admitted_univs": "admitted_university",
-        "admitted_university": "admitted_university"
+        "admitted_university": "admitted_university",
+        "country_applied_to": "country_applied_to",
+        "require_any_final_admit": "require_any_final_admit"
     }
 
     mapped_filters = {}
@@ -751,6 +859,8 @@ User query:
         admit_target = extract_admit_target_from_query(user_query)
         if admit_target:
             filters["admitted_university"] = admit_target
+
+    filters = sanitize_filters_for_country_college_query(user_query, filters)
 
     if (
         intent == "analytics"
