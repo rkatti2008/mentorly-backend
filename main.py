@@ -694,6 +694,153 @@ def format_requested_followup_details(row: dict, requested_rules) -> str:
     return "\n".join(lines)
 
 
+
+# =========================================================
+# PHASE-6.5 PATTERN ANALYTICS SUPPORT
+# =========================================================
+def split_cell_values(cell: str):
+    """Split a multi-value spreadsheet cell into clean values."""
+    if not is_non_empty_cell(cell):
+        return []
+
+    text = str(cell).strip()
+    # Keep this conservative: common separators in form responses.
+    parts = re.split(r"[;|\n]+|,(?=\s*[A-Za-z0-9])", text)
+    cleaned = []
+    for part in parts:
+        item = part.strip(" \t-•")
+        if item and item.lower() not in EMPTY_CELL_VALUES:
+            cleaned.append(item)
+    return cleaned
+
+
+def add_count(counter: dict, value: str):
+    if not is_non_empty_cell(value):
+        return
+    key = str(value).strip()
+    counter[key] = counter.get(key, 0) + 1
+
+
+def top_counts(counter: dict, limit: int = 5):
+    return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:limit]
+
+
+def extract_number(value):
+    """Extract the first plausible number from a score field."""
+    if not is_non_empty_cell(value):
+        return None
+    match = re.search(r"\d+(?:\.\d+)?", str(value))
+    if not match:
+        return None
+    try:
+        return float(match.group())
+    except ValueError:
+        return None
+
+
+def format_numeric_pattern(label: str, values: list):
+    if not values:
+        return None
+    values_sorted = sorted(values)
+    avg = sum(values_sorted) / len(values_sorted)
+    low = values_sorted[0]
+    high = values_sorted[-1]
+
+    def fmt(x):
+        return str(int(x)) if float(x).is_integer() else f"{x:.1f}"
+
+    if len(values_sorted) == 1:
+        return f"{label}: one specified value, {fmt(values_sorted[0])}"
+    return f"{label}: {len(values_sorted)} specified values; range {fmt(low)}–{fmt(high)}; average about {fmt(avg)}"
+
+
+def build_pattern_analytics(students: list, requested_rules: list) -> str:
+    """Create deterministic, data-backed pattern notes for the LLM.
+
+    The LLM may phrase these nicely, but the counts and ranges are computed here
+    so Mentorly does not invent analytics.
+    """
+    count = len(students)
+    if count == 0:
+        return "No matching students, so no pattern analytics are available."
+
+    lines = [f"Matched student count: {count}"]
+
+    school_counts = {}
+    city_counts = {}
+    major_counts = {}
+    admit_counts = {}
+
+    for row in students:
+        add_count(school_counts, extract_school_name(row))
+        city = extract_city_of_graduation(row)
+        if city:
+            add_count(city_counts, city)
+        add_count(major_counts, extract_major(row))
+
+        for col, cell in row.items():
+            if is_admit_column(col):
+                for university in extract_universities(cell):
+                    add_count(admit_counts, university)
+
+    if count >= 2:
+        if top_counts(school_counts):
+            lines.append("High schools represented: " + "; ".join(f"{k} ({v})" for k, v in top_counts(school_counts)))
+        if top_counts(city_counts):
+            lines.append("Cities of graduation represented: " + "; ".join(f"{k} ({v})" for k, v in top_counts(city_counts)))
+        if top_counts(major_counts):
+            lines.append("Intended major pattern: " + "; ".join(f"{k} ({v})" for k, v in top_counts(major_counts)))
+        if top_counts(admit_counts):
+            lines.append("Admitted university pattern: " + "; ".join(f"{k} ({v})" for k, v in top_counts(admit_counts)))
+    else:
+        lines.append("Only one matching student is available, so discuss this as a single profile rather than a broad trend.")
+
+    # Add pattern summaries for the specific requested follow-up columns.
+    for rule in requested_rules:
+        label = rule["label"]
+        raw_values = []
+        numeric_values = []
+        specified_count = 0
+
+        for row in students:
+            val = get_column_value(row, rule["columns"])
+            if val:
+                specified_count += 1
+                raw_values.append(val)
+                num = extract_number(val)
+                if num is not None:
+                    numeric_values.append(num)
+
+        if specified_count == 0:
+            lines.append(f"{label}: not specified for the matching student group.")
+            continue
+
+        numeric_line = None
+        if any(score_word in normalize(label) for score_word in ["score", "sat", "act"]):
+            numeric_line = format_numeric_pattern(label, numeric_values)
+
+        if numeric_line:
+            lines.append(numeric_line)
+            continue
+
+        value_counts = {}
+        for raw in raw_values:
+            parts = split_cell_values(raw)
+            if not parts:
+                parts = [raw]
+            for part in parts:
+                add_count(value_counts, part)
+
+        if count >= 2:
+            lines.append(
+                f"{label}: specified for {specified_count}/{count} matching students; "
+                + "; ".join(f"{k} ({v})" for k, v in top_counts(value_counts, limit=6))
+            )
+        else:
+            lines.append(f"{label}: {raw_values[0]}")
+
+    return "\n".join(lines)
+
 def clean_assistant_markdown(text: str) -> str:
     """Remove markdown artifacts from the LLM response before sending to the frontend."""
     text = text.replace("**", "")
@@ -765,6 +912,7 @@ def generate_nlg_response(user_query, students, base_response, session_id="defau
         followup_rules = requested_followup_fields(user_query)
         inherited_context_note = memory_context_sentence(session_id) if is_followup_query(user_query) else "This is not a follow-up query."
         requested_field_labels = [rule["label"] for rule in followup_rules]
+        pattern_analytics = build_pattern_analytics(students, followup_rules)
 
         student_blocks = []
         for i, row in enumerate(students, start=1):
@@ -817,6 +965,9 @@ Conversation Context:
 Requested follow-up field categories detected from the user question:
 {", ".join(requested_field_labels) if requested_field_labels else "None"}
 
+Deterministic Pattern Analytics:
+{pattern_analytics}
+
 Student Records:
 {chr(10).join(student_blocks)}
 
@@ -826,14 +977,14 @@ Write a polished, helpful response with this structure:
 2. In the next paragraph, directly describe the matching student profile(s). Do not use the heading "What the Records Show".
 3. If the user asks about SAT, ACT, AMC, AP courses, academics, boards, grades, extracurricular activities, summer programs, academic programs, projects, leadership, financial aid, or scholarships, answer using the "Requested Follow-up Details" provided in each student record.
 4. If teacher names are explicitly mentioned in the Advice text, include a plain-text section titled "Teacher and Mentor Support".
-5. Include a plain-text section titled "Patterns and Takeaways" when there is enough relevant information.
+5. Include a plain-text section titled "Patterns and Takeaways" when there is enough relevant information. Use the Deterministic Pattern Analytics section for counts, ranges, averages, and repeated themes. Do not create numerical patterns that are not listed there.
 6. Include a plain-text section titled "Practical Guidance".
 7. End with one helpful, self-contained follow-up question the user could ask next. The follow-up question should include the university, school, or student context where possible, not vague phrases like "this student".
 
 Important rules:
 - Do not invent universities, scores, schools, activities, outcomes, teachers, EE supervisors, or other facts.
 - Do not use outside knowledge.
-- You may synthesize patterns from the provided records.
+- You may synthesize patterns from the provided records, but numerical pattern claims must come from the Deterministic Pattern Analytics section.
 - You may rephrase student advice to improve clarity, but do not change its meaning.
 - If the user asks about a specific data category, such as SAT, AP courses, extracurriculars, leadership, financial aid, AMC, ACT, boards, or grade scores, prioritize the corresponding Requested Follow-up Details and do not answer generically when those details are available.
 - If requested follow-up details are unavailable for a matching student, say that the field is not specified for that student rather than guessing.
@@ -849,6 +1000,8 @@ Important rules:
 - When discussing individual students, always mention the student's High School, City of Graduation if available, Intended Major, and Admitted Universities if those fields are available.
 - From the Advice text, extract teacher or mentor names only when they are explicitly stated. If a teacher helped with LOR, Extended Essay, projects, or research, mention that relationship clearly. If no teacher/mentor names are explicitly present, omit the "Teacher and Mentor Support" section entirely. Do not invent teacher names or roles.
 - Focus on actionable insights rather than simply listing students.
+- If there are multiple matching students, compare them and call out repeated schools, cities, majors, admitted universities, score ranges, financial aid patterns, extracurricular patterns, leadership patterns, and other requested fields when those analytics are provided.
+- If there is only one matching student, avoid broad pattern claims and describe the single profile directly.
 """
 
         llm_response = client_llm.chat.completions.create(
