@@ -329,14 +329,15 @@ def get_memory(session_id: str) -> dict:
     return SESSION_MEMORY.get(session_id, {})
 
 def update_memory(session_id: str, user_query: str, filters: dict, students: list):
-    """Store the last useful filter context so follow-up questions can reuse it."""
-    if not filters:
+    """Store the exact matched student profile group for follow-up questions."""
+    if not students:
         return
 
     SESSION_MEMORY[session_id] = {
         "last_user_query": user_query,
-        "last_filters": dict(filters),
+        "last_filters": dict(filters or {}),
         "last_match_count": len(students),
+        "last_students": [student_memory_keys(row) for row in students],
     }
 
 def apply_memory_to_filters(user_query: str, filters: dict, session_id: str) -> dict:
@@ -359,8 +360,85 @@ def memory_context_sentence(session_id: str) -> str:
     previous_count = memory.get("last_match_count")
 
     if previous_query and previous_count is not None:
-        return f'This appears to be a follow-up to the earlier query: "{previous_query}". Reuse that student group as the context.'
+        return f'This appears to be a follow-up to the earlier query: "{previous_query}". Reuse that exact matched student group as the context.'
     return "No previous context is available."
+
+def extract_student_id(row: dict):
+    """Extract a stable student identifier from the row when available."""
+    preferred_names = ["student id", "student_id", "id"]
+
+    for col, val in row.items():
+        col_norm = normalize(col).replace(" ", "_")
+        if col_norm in {"student_id", "studentid"} and is_non_empty_cell(val):
+            return str(val).strip()
+
+    for col, val in row.items():
+        col_norm = normalize(col)
+        if any(name in col_norm for name in preferred_names) and is_non_empty_cell(val):
+            return str(val).strip()
+
+    return None
+
+def row_signature(row: dict) -> str:
+    """Fallback identifier when Student ID is absent."""
+    school = extract_school_name(row)
+    city = extract_city_of_graduation(row) or ""
+    major = extract_major(row)
+    admitted = []
+    for col, cell in row.items():
+        if is_admit_column(col):
+            admitted.extend(extract_universities(cell))
+    return normalize(f"{school}|{city}|{major}|{','.join(sorted(set(admitted)))}")
+
+def student_memory_keys(row: dict):
+    """Return both Student ID and fallback signature for profile memory."""
+    return {
+        "student_id": extract_student_id(row),
+        "signature": row_signature(row),
+    }
+
+def filter_has_explicit_student_context(filters: dict) -> bool:
+    """Detect whether the current query has its own selection context.
+
+    If true, we should not blindly reuse the previous student group.
+    """
+    if not filters:
+        return False
+
+    context_keys = {
+        "school", "school_name", "admitted", "admitted_univs", "admitted_university",
+        "country_applied_to", "countries_applied_to", "country", "require_any_final_admit"
+    }
+
+    for k, v in filters.items():
+        k_norm = normalize(k).replace(" ", "_")
+        if k_norm in context_keys and is_non_empty_cell(v):
+            return True
+        if is_school_column(k) and is_non_empty_cell(v):
+            return True
+        if is_admit_column(k) and is_non_empty_cell(v):
+            return True
+
+    return False
+
+def get_students_from_profile_memory(records: list, session_id: str):
+    """Retrieve the exact previously matched student group from memory."""
+    memory = get_memory(session_id)
+    memory_students = memory.get("last_students", [])
+    if not memory_students:
+        return None
+
+    remembered_ids = {s.get("student_id") for s in memory_students if s.get("student_id")}
+    remembered_signatures = {s.get("signature") for s in memory_students if s.get("signature")}
+
+    matched = []
+    for row in records:
+        sid = extract_student_id(row)
+        sig = row_signature(row)
+        if (sid and sid in remembered_ids) or (sig and sig in remembered_signatures):
+            matched.append(row)
+
+    return matched if matched else None
 
 # -------------------------------
 # Core Filter Engine (UNCHANGED)
@@ -871,14 +949,27 @@ User query:
         if match:
             filters["school_name"] = match.group(1).strip()
 
-    # If this is a follow-up question, inherit the previous admit/school context
-    # unless the current question explicitly provides a new one.
-    filters = apply_memory_to_filters(user_query, filters, session_id)
+    explicit_context_in_current_query = filter_has_explicit_student_context(filters)
 
     records = sheet.get_all_records()
-    students = filter_students(records, filters)
 
-    #  Save useful context for the next turn, e.g. Cornell admits -> SAT scores / financial aid.
+    # Student profile memory:
+    # For follow-ups like "What about their SAT scores?" or "Did they get financial aid?",
+    # reuse the exact student group from the previous turn instead of asking the LLM
+    # to reconstruct the same filters.
+    memory_students = None
+    if is_followup_query(user_query) and not explicit_context_in_current_query:
+        memory_students = get_students_from_profile_memory(records, session_id)
+
+    if memory_students is not None:
+        students = memory_students
+    else:
+        # If this is a follow-up with no exact student group available, inherit
+        # the previous filters as a fallback.
+        filters = apply_memory_to_filters(user_query, filters, session_id)
+        students = filter_students(records, filters)
+
+    # Save the exact matched student group for the next turn.
     update_memory(session_id, user_query, filters, students)
 
     base_response = handle_analytics_response(user_query, students)
