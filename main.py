@@ -2,6 +2,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from openai import OpenAI
 from pydantic import BaseModel
+from typing import Optional
 import gspread
 from google.oauth2.service_account import Credentials
 import os, json, re
@@ -35,10 +36,21 @@ sheet = gspread.authorize(creds).open_by_key(os.environ["SHEET_ID"]).sheet1
 client_llm = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # -------------------------------
+# Lightweight Conversation Memory
+# -------------------------------
+# Render instances are stateless across restarts, so this memory is intentionally
+# lightweight and in-process. It works well for short chat sessions while the
+# same backend instance is running. For production-grade memory, replace this
+# with Redis, a database, or frontend-managed conversation state.
+SESSION_MEMORY = {}
+
+
+# -------------------------------
 # Models
 # -------------------------------
 class ChatRequest(BaseModel):
     message: str
+    session_id: Optional[str] = "default"
 
 # -------------------------------
 # Intent Classification
@@ -189,6 +201,74 @@ def extract_admit_target_from_query(query: str):
             return target if target else None
 
     return None
+
+
+# -------------------------------
+# Conversation Memory Helpers
+# -------------------------------
+def is_followup_query(query: str) -> bool:
+    """Detect short follow-up questions that rely on earlier context."""
+    q = normalize(query)
+
+    followup_starters = [
+        "what about", "how about", "did they", "do they", "were they", "was the student",
+        "what were their", "what was their", "their", "those students", "that student",
+        "same students", "same student", "what did they", "where did they"
+    ]
+
+    followup_topics = [
+        "sat", "act", "amc", "ap", "financial aid", "scholarship", "aid",
+        "extracurricular", "extra curricular", "activities", "leadership", "courses",
+        "projects", "research", "summer", "board", "scores", "grades", "lor", "ee"
+    ]
+
+    has_followup_language = any(starter in q for starter in followup_starters)
+    has_topic = any(topic in q for topic in followup_topics)
+
+    # A short topic-only query like "SAT scores?" or "Financial aid?" should also inherit context.
+    short_query = len(q.split()) <= 7
+
+    return has_followup_language or (short_query and has_topic)
+
+def get_session_key(req: ChatRequest) -> str:
+    return req.session_id.strip() if req.session_id and req.session_id.strip() else "default"
+
+def get_memory(session_id: str) -> dict:
+    return SESSION_MEMORY.get(session_id, {})
+
+def update_memory(session_id: str, user_query: str, filters: dict, students: list):
+    """Store the last useful filter context so follow-up questions can reuse it."""
+    if not filters:
+        return
+
+    SESSION_MEMORY[session_id] = {
+        "last_user_query": user_query,
+        "last_filters": dict(filters),
+        "last_match_count": len(students),
+    }
+
+def apply_memory_to_filters(user_query: str, filters: dict, session_id: str) -> dict:
+    """Merge previous filters into follow-up queries when the user omits context."""
+    if not is_followup_query(user_query):
+        return filters
+
+    memory = get_memory(session_id)
+    previous_filters = memory.get("last_filters", {})
+    if not previous_filters:
+        return filters
+
+    merged = dict(previous_filters)
+    merged.update(filters or {})  # Explicit current filters always win.
+    return merged
+
+def memory_context_sentence(session_id: str) -> str:
+    memory = get_memory(session_id)
+    previous_query = memory.get("last_user_query")
+    previous_count = memory.get("last_match_count")
+
+    if previous_query and previous_count is not None:
+        return f'This appears to be a follow-up to the earlier query: "{previous_query}". Reuse that student group as the context.'
+    return "No previous context is available."
 
 # -------------------------------
 # Core Filter Engine (UNCHANGED)
@@ -500,10 +580,11 @@ def handle_analytics_response(query, students):
 # =========================================================
 # PHASE-6.3 LLM NLG LAYER (FIXED)
 # =========================================================
-def generate_nlg_response(user_query, students, base_response):
+def generate_nlg_response(user_query, students, base_response, session_id="default"):
     try:
         count = len(students)
         followup_rules = requested_followup_fields(user_query)
+        inherited_context_note = memory_context_sentence(session_id) if is_followup_query(user_query) else "This is not a follow-up query."
         requested_field_labels = [rule["label"] for rule in followup_rules]
 
         student_blocks = []
@@ -550,6 +631,9 @@ User Question:
 "{user_query}"
 
 Total matching students found: {count}
+
+Conversation Context:
+{inherited_context_note}
 
 Requested follow-up field categories detected from the user question:
 {", ".join(requested_field_labels) if requested_field_labels else "None"}
@@ -612,6 +696,7 @@ Important rules:
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
     user_query = clean_user_query(req.message)
+    session_id = get_session_key(req)
     intent = classify_intent(user_query)
 
     if intent == "advisory":
@@ -676,8 +761,15 @@ User query:
         if match:
             filters["school_name"] = match.group(1).strip()
 
+    # If this is a follow-up question, inherit the previous admit/school context
+    # unless the current question explicitly provides a new one.
+    filters = apply_memory_to_filters(user_query, filters, session_id)
+
     records = sheet.get_all_records()
     students = filter_students(records, filters)
 
+    # Save useful context for the next turn, e.g. Cornell admits -> SAT scores / financial aid.
+    update_memory(session_id, user_query, filters, students)
+
     base_response = handle_analytics_response(user_query, students)
-    return generate_nlg_response(user_query, students, base_response)
+    return generate_nlg_response(user_query, students, base_response, session_id=session_id)
