@@ -327,19 +327,81 @@ def is_greeting_query(q: str) -> bool:
     return q_norm in greetings
 
 def is_small_talk_query(q: str) -> bool:
-    """Return True for simple closing/thanks messages."""
+    """Return True for simple conversational acknowledgements.
+
+    These should not trigger database lookup, OpenAI calls, analytics,
+    dashboard summaries, or student-profile retrieval.
+    """
     q_norm = normalize(q)
-    phrases = {
+
+    # Exact short conversational responses.
+    exact_phrases = {
         "thanks",
         "thank you",
         "thankyou",
         "thx",
+        "thnx",
+        "ty",
+        "sure thank you",
+        "sure thanks",
+        "ok thanks",
+        "okay thanks",
+        "great thanks",
+        "cool thanks",
+        "perfect thanks",
+        "got it thanks",
+        "yup thanks",
+        "yep thanks",
+        "many thanks",
+        "thanks a lot",
+        "thank you so much",
+        "bet",
+        "you bet",
+        "got it",
+        "understood",
+        "makes sense",
+        "i see",
+        "nice",
+        "great",
+        "awesome",
+        "perfect",
+        "wonderful",
+        "super",
+        "superb",
+        "excellent",
+        "cool",
+        "amazing",
+        "brilliant",
+        "fantastic",
         "bye",
         "goodbye",
         "see you",
         "see ya",
+        "good night",
     }
-    return q_norm in phrases
+
+    if q_norm in exact_phrases:
+        return True
+
+    # Catch natural variants like "sure, thank you!", "wonderful, thanks",
+    # "thnx mentorly", etc., but keep this narrow so real queries still work.
+    thank_tokens = ["thank", "thanks", "thankyou", "thx", "thnx"]
+    positive_tokens = [
+        "bet", "you bet", "wonderful", "super", "superb", "great",
+        "awesome", "perfect", "cool", "nice", "excellent", "amazing",
+        "brilliant", "fantastic"
+    ]
+
+    short_query = len(q_norm.split()) <= 5
+
+    if short_query and any(token in q_norm for token in thank_tokens):
+        return True
+
+    if short_query and any(token in q_norm for token in positive_tokens):
+        return True
+
+    return False
+
 
 def first_name_from_user(user: Optional[dict]) -> str:
     if not user:
@@ -363,14 +425,35 @@ def build_greeting_response(username: str) -> dict:
 
 def build_small_talk_response(username: str, user_query: str) -> dict:
     q_norm = normalize(user_query)
-    if q_norm in {"bye", "goodbye", "see you", "see ya"}:
-        answer = f"Goodbye {username}! Come back anytime when you want to explore student profiles or college admissions patterns."
+
+    if q_norm in {"bye", "goodbye", "see you", "see ya", "good night"}:
+        responses = [
+            f"Goodbye {username}! Come back anytime when you want to explore student profiles or college admissions patterns.",
+            f"See you, {username}! I’ll be here whenever you want to continue.",
+            f"Good night {username}! Happy to help again anytime.",
+        ]
+    elif any(token in q_norm for token in ["thank", "thanks", "thankyou", "thx", "thnx"]):
+        responses = [
+            f"You're very welcome, {username}!",
+            f"My pleasure, {username}!",
+            f"Happy to help, {username}!",
+            f"Anytime, {username}!",
+            f"You're welcome, {username}!",
+        ]
     else:
-        answer = f"You're very welcome, {username}! If you have more questions about admissions or student profiles, I'm here to help."
+        responses = [
+            f"Glad that helped, {username}!",
+            f"Wonderful, {username}! Happy to help.",
+            f"Great, {username}! Let me know what you’d like to explore next.",
+            f"Super, {username}! I’m here whenever you need help.",
+            f"Perfect, {username}!",
+        ]
+
     return {
         "intent": "small_talk",
-        "assistant_answer": answer,
+        "assistant_answer": random.choice(responses),
     }
+
 
 # -------------------------------
 # University Canonicalization
