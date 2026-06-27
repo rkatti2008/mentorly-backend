@@ -1,5 +1,5 @@
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
 from typing import Optional
@@ -7,7 +7,7 @@ from datetime import datetime
 from collections import Counter
 import gspread
 from google.oauth2.service_account import Credentials
-import os, json, re
+import os, json, re, sqlite3, secrets, hashlib
 
 app = FastAPI()
 
@@ -64,7 +64,167 @@ def save_session_memory():
         # Never break the API because session persistence failed.
         pass
 
+
 SESSION_MEMORY = load_session_memory()
+
+
+# -------------------------------
+# User Auth / Login Database
+# -------------------------------
+# SQLite is used for the first version because it is simple and has no extra
+# package dependency. On Render, set USER_DB_PATH to a persistent disk path
+# later if you want the login database to survive redeploys/restarts reliably.
+USER_DB_PATH = os.environ.get("USER_DB_PATH", "mentorly_users.db")
+
+def get_db_connection():
+    conn = sqlite3.connect(USER_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_user_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            login_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_login TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            session_id TEXT,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def hash_password(password: str) -> str:
+    """Hash a password using PBKDF2-HMAC-SHA256 with a random salt."""
+    salt = secrets.token_hex(16)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        120_000,
+    ).hex()
+    return f"pbkdf2_sha256${salt}${derived}"
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, salt, expected = stored_hash.split("$", 2)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            120_000,
+        ).hex()
+        return secrets.compare_digest(derived, expected)
+    except Exception:
+        return False
+
+def get_user_by_username_or_email(username_or_email: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM users
+        WHERE lower(username) = lower(?) OR lower(email) = lower(?)
+        """,
+        (username_or_email, username_or_email),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_user_by_token(auth_token: Optional[str]):
+    if not auth_token:
+        return None
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT users.*
+        FROM auth_sessions
+        JOIN users ON auth_sessions.user_id = users.id
+        WHERE auth_sessions.token = ?
+        """,
+        (auth_token,),
+    )
+    row = cur.fetchone()
+
+    if row:
+        cur.execute(
+            "UPDATE auth_sessions SET last_used_at = ? WHERE token = ?",
+            (datetime.utcnow().isoformat() + "Z", auth_token),
+        )
+        conn.commit()
+
+    conn.close()
+    return dict(row) if row else None
+
+def create_auth_session(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.utcnow().isoformat() + "Z"
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO auth_sessions (token, user_id, created_at, last_used_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (token, user_id, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    return token
+
+def record_chat_history(user_id: Optional[int], session_id: str, question: str, answer: str):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO chat_history (user_id, session_id, question, answer, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, session_id, question, answer, datetime.utcnow().isoformat() + "Z"),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        # Chat should never fail because history logging failed.
+        pass
+
+init_user_db()
 
 
 # -------------------------------
@@ -73,6 +233,19 @@ SESSION_MEMORY = load_session_memory()
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = "default"
+    auth_token: Optional[str] = None
+
+class SignupRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class AuthRequest(BaseModel):
+    auth_token: str
 
 # -------------------------------
 # High-level Query Type Detection
@@ -378,7 +551,14 @@ def is_followup_query(query: str) -> bool:
     return has_followup_language or (short_query and has_topic)
 
 def get_session_key(req: ChatRequest) -> str:
+    """Prefer logged-in user memory; fall back to anonymous session_id."""
+    user = get_user_by_token(req.auth_token)
+    if user:
+        return f"user:{user['id']}"
     return req.session_id.strip() if req.session_id and req.session_id.strip() else "default"
+
+def get_authenticated_user_from_request(req: ChatRequest):
+    return get_user_by_token(req.auth_token)
 
 def get_memory(session_id: str) -> dict:
     return SESSION_MEMORY.get(session_id, {})
@@ -1451,25 +1631,169 @@ Important rules:
 # -------------------------------
 # API
 # -------------------------------
+@app.post("/signup")
+async def signup(req: SignupRequest):
+    username = req.username.strip()
+    email = req.email.strip().lower()
+    password = req.password
+
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters long.")
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+
+    now = datetime.utcnow().isoformat() + "Z"
+    password_hash = hash_password(password)
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO users (username, email, password_hash, login_count, created_at, last_login)
+            VALUES (?, ?, ?, 0, ?, NULL)
+            """,
+            (username, email, password_hash, now),
+        )
+        conn.commit()
+        user_id = cur.lastrowid
+        conn.close()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Username or email already exists.")
+
+    token = create_auth_session(user_id)
+
+    return {
+        "success": True,
+        "message": "Account created successfully.",
+        "user_id": user_id,
+        "username": username,
+        "email": email,
+        "auth_token": token,
+    }
+
+@app.post("/login")
+async def login(req: LoginRequest):
+    username = req.username.strip()
+    password = req.password
+
+    user = get_user_by_username_or_email(username)
+    if not user or not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username/email or password.")
+
+    now = datetime.utcnow().isoformat() + "Z"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE users
+        SET login_count = COALESCE(login_count, 0) + 1,
+            last_login = ?
+        WHERE id = ?
+        """,
+        (now, user["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    # Re-read updated user record.
+    user = get_user_by_username_or_email(username)
+    token = create_auth_session(user["id"])
+
+    return {
+        "success": True,
+        "message": "Login successful.",
+        "user_id": user["id"],
+        "username": user["username"],
+        "email": user["email"],
+        "login_count": user["login_count"],
+        "last_login": user["last_login"],
+        "auth_token": token,
+    }
+
+@app.post("/logout")
+async def logout(req: AuthRequest):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM auth_sessions WHERE token = ?", (req.auth_token,))
+    conn.commit()
+    conn.close()
+    return {"success": True, "message": "Logged out successfully."}
+
+@app.post("/me")
+async def me(req: AuthRequest):
+    user = get_user_by_token(req.auth_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired auth token.")
+
+    return {
+        "user_id": user["id"],
+        "username": user["username"],
+        "email": user["email"],
+        "login_count": user["login_count"],
+        "created_at": user["created_at"],
+        "last_login": user["last_login"],
+    }
+
+@app.get("/admin/users")
+async def admin_users():
+    """Basic user stats endpoint. Protect this later before public launch."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, username, email, login_count, created_at, last_login
+        FROM users
+        ORDER BY id DESC
+        """
+    )
+    users = [dict(row) for row in cur.fetchall()]
+    cur.execute("SELECT COUNT(*) AS cnt FROM chat_history")
+    chat_count = cur.fetchone()["cnt"]
+    conn.close()
+    return {
+        "total_users": len(users),
+        "total_chat_questions": chat_count,
+        "users": users,
+    }
+
+
+def with_chat_history(response: dict, user_id: Optional[int], session_id: str, question: str):
+    try:
+        answer = response.get("assistant_answer", "")
+        record_chat_history(user_id, session_id, question, answer)
+    except Exception:
+        pass
+    return response
+
 @app.post("/nl_query")
 async def nl_query(req: ChatRequest):
     user_query = clean_user_query(req.message)
+    authenticated_user = get_authenticated_user_from_request(req)
     session_id = get_session_key(req)
     intent = classify_intent(user_query)
     records = sheet.get_all_records()
 
     # New feature routes. These are additive and do not disturb the existing analytics flow.
+    user_id = authenticated_user["id"] if authenticated_user else None
+
     if intent == "dashboard":
-        return handle_dashboard_query(user_query, records, session_id)
+        response = handle_dashboard_query(user_query, records, session_id)
+        return with_chat_history(response, user_id, session_id, user_query)
 
     if intent == "similarity":
-        return handle_similar_student_search(user_query, records, session_id)
+        response = handle_similar_student_search(user_query, records, session_id)
+        return with_chat_history(response, user_id, session_id, user_query)
 
     if intent == "university_insights":
-        return handle_university_insights(user_query, records, session_id)
+        response = handle_university_insights(user_query, records, session_id)
+        return with_chat_history(response, user_id, session_id, user_query)
 
     if intent == "advisory":
-        return handle_advisory_flow(user_query, records, session_id)
+        response = handle_advisory_flow(user_query, records, session_id)
+        return with_chat_history(response, user_id, session_id, user_query)
 
     filters = extract_filters_for_query(user_query)
 
@@ -1495,7 +1819,8 @@ async def nl_query(req: ChatRequest):
     update_memory(session_id, user_query, filters, students)
 
     base_response = handle_analytics_response(user_query, students)
-    return generate_nlg_response(user_query, students, base_response, session_id=session_id)
+    response = generate_nlg_response(user_query, students, base_response, session_id=session_id)
+    return with_chat_history(response, user_id, session_id, user_query)
 
 @app.get("/dashboard")
 async def dashboard():
