@@ -7,7 +7,7 @@ from datetime import datetime
 from collections import Counter
 import gspread
 from google.oauth2.service_account import Credentials
-import os, json, re, sqlite3, secrets, hashlib
+import os, json, re, sqlite3, secrets, hashlib, random
 
 app = FastAPI()
 
@@ -302,6 +302,75 @@ def clean_user_query(q: str) -> str:
     if (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'")):
         q = q[1:-1]
     return q.strip()
+
+# -------------------------------
+# Simple Conversation Helpers
+# -------------------------------
+def is_greeting_query(q: str) -> bool:
+    """Return True only for simple greeting-only messages.
+
+    These should not trigger database lookup or OpenAI calls.
+    """
+    q_norm = normalize(q)
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "namaste",
+        "hiya",
+        "hey there",
+        "hello there",
+    }
+    return q_norm in greetings
+
+def is_small_talk_query(q: str) -> bool:
+    """Return True for simple closing/thanks messages."""
+    q_norm = normalize(q)
+    phrases = {
+        "thanks",
+        "thank you",
+        "thankyou",
+        "thx",
+        "bye",
+        "goodbye",
+        "see you",
+        "see ya",
+    }
+    return q_norm in phrases
+
+def first_name_from_user(user: Optional[dict]) -> str:
+    if not user:
+        return "there"
+    username = str(user.get("username") or "there").strip()
+    if not username:
+        return "there"
+    return username.split()[0]
+
+def build_greeting_response(username: str) -> dict:
+    responses = [
+        f"Hello {username}! How can I help you today?",
+        f"Hi {username}! What's on your mind today?",
+        f"Hello {username}! What information can I help you find today?",
+        f"Hi {username}! How may I assist you with your college planning today?",
+    ]
+    return {
+        "intent": "greeting",
+        "assistant_answer": random.choice(responses),
+    }
+
+def build_small_talk_response(username: str, user_query: str) -> dict:
+    q_norm = normalize(user_query)
+    if q_norm in {"bye", "goodbye", "see you", "see ya"}:
+        answer = f"Goodbye {username}! Come back anytime when you want to explore student profiles or college admissions patterns."
+    else:
+        answer = f"You're very welcome, {username}! If you have more questions about admissions or student profiles, I'm here to help."
+    return {
+        "intent": "small_talk",
+        "assistant_answer": answer,
+    }
 
 # -------------------------------
 # University Canonicalization
@@ -1680,8 +1749,11 @@ async def login(req: LoginRequest):
     password = req.password
 
     user = get_user_by_username_or_email(username)
-    if not user or not verify_password(password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid username/email or password.")
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid user. Please sign up first.")
+
+    if not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect password.")
 
     now = datetime.utcnow().isoformat() + "Z"
     conn = get_db_connection()
@@ -1773,11 +1845,21 @@ async def nl_query(req: ChatRequest):
     user_query = clean_user_query(req.message)
     authenticated_user = get_authenticated_user_from_request(req)
     session_id = get_session_key(req)
+    user_id = authenticated_user["id"] if authenticated_user else None
+    username = first_name_from_user(authenticated_user)
+
+    # Simple greetings/thanks should feel conversational and should not trigger
+    # Google Sheets lookup, OpenAI calls, analytics, or database search.
+    if is_greeting_query(user_query):
+        return with_chat_history(build_greeting_response(username), user_id, session_id, user_query)
+
+    if is_small_talk_query(user_query):
+        return with_chat_history(build_small_talk_response(username, user_query), user_id, session_id, user_query)
+
     intent = classify_intent(user_query)
     records = sheet.get_all_records()
 
     # New feature routes. These are additive and do not disturb the existing analytics flow.
-    user_id = authenticated_user["id"] if authenticated_user else None
 
     if intent == "dashboard":
         response = handle_dashboard_query(user_query, records, session_id)
